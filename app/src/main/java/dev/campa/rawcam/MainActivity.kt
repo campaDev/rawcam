@@ -102,7 +102,10 @@ class MainActivity : Activity() {
         }
 
         val bars = object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) = syncControls()
+            override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
+                // Touching a slider implies manual exposure; the switch listener re-syncs.
+                if (fromUser && autoSwitch.isChecked) autoSwitch.isChecked = false else syncControls()
+            }
             override fun onStartTrackingTouch(s: SeekBar) {}
             override fun onStopTrackingTouch(s: SeekBar) {}
         }
@@ -171,8 +174,8 @@ class MainActivity : Activity() {
 
     private fun syncControls() {
         manual = !autoSwitch.isChecked
-        isoBar.isEnabled = manual
-        expBar.isEnabled = manual
+        isoBar.isEnabled = true
+        expBar.isEnabled = true
 
         isoValue = logLerp(isoRange.lower.toDouble(), isoRange.upper.toDouble(), isoBar.progress / 1000.0).roundToInt()
         val maxExp = min(expRange.upper, 1_000_000_000L).toDouble()
@@ -256,7 +259,8 @@ class MainActivity : Activity() {
             if (frameCount++ % 15 != 0) return
             val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: return
             val exp = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: return
-            runOnUiThread { info.text = "Sensor: ISO $iso · ${formatExposure(exp)}" }
+            val mode = if (manual) "Manual" else "Auto"
+            runOnUiThread { info.text = "$mode · Sensor: ISO $iso · ${formatExposure(exp)}" }
         }
     }
 
@@ -324,7 +328,8 @@ class MainActivity : Activity() {
             val name = "RAW_$stamp.dng"
             val uri = insertImage(name, "image/x-adobe-dng")
             contentResolver.openOutputStream(uri)!!.use { out ->
-                DngCreator(chars, result).use { dng ->
+                val (dngChars, dngResult) = dngSource(result)
+                DngCreator(dngChars, dngResult).use { dng ->
                     dng.setOrientation(exifOrientation())
                     dng.writeImage(out, image)
                 }
@@ -337,6 +342,23 @@ class MainActivity : Activity() {
             image.close()
             runOnUiThread { shutter.isEnabled = true }
         }
+    }
+
+    /**
+     * Logical multi-cameras (Pixel 7 main) may lack color calibration tags that DngCreator
+     * requires; those live on the physical sensor that actually produced the frame.
+     */
+    private fun dngSource(result: TotalCaptureResult): Pair<CameraCharacteristics, CaptureResult> {
+        if (chars.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT1) != null) return chars to result
+
+        val active = result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)
+        val candidates = listOfNotNull(active) + chars.physicalCameraIds
+        val physId = candidates.firstOrNull { id ->
+            manager.getCameraCharacteristics(id).get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT1) != null
+        } ?: return chars to result
+
+        val physResult = result.physicalCameraResults[physId] ?: result
+        return manager.getCameraCharacteristics(physId) to physResult
     }
 
     private fun saveJpeg(image: Image) {
