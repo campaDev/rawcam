@@ -3,6 +3,7 @@ package dev.campa.rawcam
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.Rect
@@ -18,6 +19,18 @@ import kotlin.math.sqrt
 class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs) {
 
     var showGrid = false
+        set(value) {
+            field = value
+            invalidate()
+        }
+
+    /** Framing guide as width/height (0 = none). Safe zones mark where TikTok/Reels/Stories overlay UI. */
+    var guideAspect = 0f
+        set(value) {
+            field = value
+            invalidate()
+        }
+    var guideSafeZones = false
         set(value) {
             field = value
             invalidate()
@@ -42,6 +55,18 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
         style = Paint.Style.STROKE
         strokeWidth = 2f * density
         color = 0xFF4FC3F7.toInt()
+    }
+    private val shadePaint = Paint().apply { color = 0x99000000.toInt() }
+    private val guidePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2f * density
+        color = 0xFFFFFFFF.toInt()
+    }
+    private val dashedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 1f * density
+        color = 0xCCFFD54F.toInt()
+        pathEffect = DashPathEffect(floatArrayOf(8f * density, 6f * density), 0f)
     }
     private val dst = Rect()
     private val histPath = Path()
@@ -69,11 +94,47 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
             dst.set(0, 0, width, height)
             canvas.drawBitmap(it, null, dst, maskPaint)
         }
+        drawGuide(canvas)
         for (f in faces) {
             canvas.drawRect(f.left * width, f.top * height, f.right * width, f.bottom * height, facePaint)
         }
         if (showGrid) drawGrid(canvas)
         histogram?.let { drawHistogram(canvas, it) }
+    }
+
+    private fun drawGuide(c: Canvas) {
+        if (guideAspect <= 0f) return
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val rw: Float
+        val rh: Float
+        if (guideAspect > w / h) {
+            rw = w
+            rh = w / guideAspect
+        } else {
+            rh = h
+            rw = h * guideAspect
+        }
+        val left = (w - rw) / 2
+        val top = (h - rh) / 2
+        val right = left + rw
+        val bottom = top + rh
+
+        c.drawRect(0f, 0f, w, top, shadePaint)
+        c.drawRect(0f, bottom, w, h, shadePaint)
+        c.drawRect(0f, top, left, bottom, shadePaint)
+        c.drawRect(right, top, w, bottom, shadePaint)
+        c.drawRect(left, top, right, bottom, guidePaint)
+
+        // 5% inner margin so the product never touches the edge after the platform's own crop.
+        val m = min(rw, rh) * 0.05f
+        c.drawRect(left + m, top + m, right - m, bottom - m, dashedPaint)
+
+        if (guideSafeZones) {
+            c.drawLine(left, top + rh * SAFE_TOP, right, top + rh * SAFE_TOP, dashedPaint)
+            c.drawLine(left, bottom - rh * SAFE_BOTTOM, right, bottom - rh * SAFE_BOTTOM, dashedPaint)
+            c.drawLine(right - rw * SAFE_RIGHT, top + rh * SAFE_TOP, right - rw * SAFE_RIGHT, bottom - rh * SAFE_BOTTOM, dashedPaint)
+        }
     }
 
     private fun drawGrid(c: Canvas) {
@@ -123,5 +184,10 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
 
     private companion object {
         const val CLIP_FRACTION = 0.005
+
+        // Approximate areas covered by TikTok / Reels / Stories interface (fraction of frame).
+        const val SAFE_TOP = 0.14f
+        const val SAFE_BOTTOM = 0.22f
+        const val SAFE_RIGHT = 0.15f
     }
 }

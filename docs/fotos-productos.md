@@ -1,7 +1,12 @@
-# Fotos de productos (diseño, pendiente)
+# Fotos de productos
 
-Estado: **diseño, sin implementar**. Funciones para fotografiar el catálogo de TechNTere:
-color fiel, consistencia entre tomas y archivos listos para publicar.
+Funciones para fotografiar el catálogo de TechNTere: color fiel, consistencia entre tomas y
+archivos listos para publicar. Canales de publicación: **WhatsApp, Instagram, Facebook y TikTok**
+(MercadoLibre no se usa).
+
+Estado:
+- ✅ Implementado: **1** tarjeta gris, **2** sesión de producto, **3** guías de encuadre.
+- ⏳ Pendiente: 4–8.
 
 ## Prioridades
 
@@ -9,7 +14,7 @@ color fiel, consistencia entre tomas y archivos listos para publicar.
 |---|---|---|---|
 | 1 | Balance de blancos con tarjeta gris | Baja | 1 |
 | 2 | Modo sesión de producto (bloqueos) | Baja | 1 |
-| 3 | Guías de encuadre 1:1 y 4:5 | Baja | 1 |
+| 3 | Guías de encuadre 1:1, 4:5 y 9:16 | Baja | 1 |
 | 4 | Nombres y carpetas por SKU | Baja | 1 |
 | 5 | Exportación lista para la web | Media | 2 |
 | 6 | Fondo blanco automático | Media | 2 |
@@ -49,10 +54,19 @@ plateado de un cargador, cálido.
 - Recomendación de uso: celu en trípode, luz continua y timer de 2 s o "Esperar quietud".
 
 ## 3. Guías de encuadre
-- Marcos sobre la vista previa en `OverlayView`: **1:1** (MercadoLibre, catálogo web) y
-  **4:5** (Instagram), con el exterior oscurecido.
-- Margen de seguridad interior (p. ej. 5%) para que el producto no toque el borde.
-- Selector: Libre / 1:1 / 4:5 / 16:9.
+Marcos sobre la vista previa en `OverlayView`, con el exterior oscurecido y un margen interior
+punteado del 5% para que el producto no toque el borde:
+
+| Guía | Uso |
+|---|---|
+| Libre | Sin guía (3:4 nativo del sensor; WhatsApp lo muestra completo) |
+| **1:1** | Feed de Instagram y Facebook, catálogo y foto de perfil de WhatsApp Business |
+| **4:5** | Publicación vertical de Instagram y Facebook (lo que más pantalla ocupa en el feed) |
+| **9:16** | TikTok, Reels, Historias de IG/FB y Estados de WhatsApp |
+
+En 9:16 se marcan además las **zonas seguras**, donde esas apps tapan la imagen con su
+interfaz: ~14% arriba, ~22% abajo (descripción, botones) y ~15% a la derecha (likes,
+comentarios). El producto y el texto importante tienen que quedar dentro.
 
 ## 4. Nombres y carpetas por SKU
 - Campo de texto "SKU" antes de la sesión (p. ej. `TNT-0123`).
@@ -62,8 +76,10 @@ plateado de un cargador, cálido.
 
 ## 5. Exportación lista para la web
 Junto al RAW, generar un JPEG adicional:
-- Recorte según la guía elegida (1:1 por defecto).
-- Lado largo de 2000 px, sRGB, calidad 85–90.
+- Recorte según la guía elegida (1:1, 4:5 o 9:16).
+- Tamaños por red: 1080×1080 (1:1), 1080×1350 (4:5), 1080×1920 (9:16); sRGB, calidad 85–90.
+  Instagram, Facebook, TikTok y WhatsApp recomprimen todo lo que supere ~1080 px de ancho, así
+  que subir más grande no mejora la calidad.
 - Opcional: marca de agua con el logo de TechNTere (PNG en assets), en una esquina y con
   opacidad configurable.
 - Nombre: `<SKU>_01_web.jpg`.

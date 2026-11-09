@@ -103,7 +103,10 @@ class MainActivity : Activity() {
         TUNGSTEN("WB incandesc.", CaptureRequest.CONTROL_AWB_MODE_INCANDESCENT),
         FLUORESCENT("WB fluoresc.", CaptureRequest.CONTROL_AWB_MODE_FLUORESCENT),
         KELVIN("WB Kelvin", CaptureRequest.CONTROL_AWB_MODE_OFF),
+        CARD("WB tarjeta gris", CaptureRequest.CONTROL_AWB_MODE_OFF),
     }
+
+    private data class Guide(val label: String, val aspect: Float, val safeZones: Boolean)
 
     private val drives = listOf(
         Drive("Simple", DriveKind.SINGLE, listOf(0.0)),
@@ -118,6 +121,12 @@ class MainActivity : Activity() {
         Drive("Promedio ×32", DriveKind.STACK, List(32) { 0.0 }),
         Drive("Astro ×16 (∞)", DriveKind.STACK, List(16) { 0.0 }, infinity = true),
         Drive("Astro ×32 (∞)", DriveKind.STACK, List(32) { 0.0 }, infinity = true),
+    )
+    private val guides = listOf(
+        Guide("Guía: libre", 0f, false),
+        Guide("Guía 1:1 · feed IG/FB/WA", 1f, false),
+        Guide("Guía 4:5 · IG/FB vertical", 0.8f, false),
+        Guide("Guía 9:16 · TikTok/Reels/Estados", 9f / 16f, true),
     )
     private val timers = listOf(0, 2, 10)
     private val intervals = listOf(0, 2, 5, 10, 30, 60)
@@ -189,6 +198,17 @@ class MainActivity : Activity() {
     // Camera handler thread only.
     private var burstSequence = false
     @Volatile private var bestOnly = false
+
+    private lateinit var guideBtn: Button
+    private lateinit var sessionToggle: CheckBox
+    private var guideIndex = 0
+
+    // Grey-card white balance: gains measured from a tapped neutral patch (refined over a few passes).
+    @Volatile private var cardGains: RggbChannelVector? = null
+    @Volatile private var lastGains: RggbChannelVector? = null
+    private var awaitingCard = false
+    private var cardPass = 0
+    @Volatile private var sessionLocked = false
 
     private lateinit var ettrToggle: CheckBox
     private lateinit var faceToggle: CheckBox
@@ -363,6 +383,17 @@ class MainActivity : Activity() {
         locationToggle = findViewById(R.id.locationToggle)
         intervalBtn = findViewById(R.id.intervalBtn)
         shotsBtn = findViewById(R.id.shotsBtn)
+        guideBtn = findViewById(R.id.guideBtn)
+        sessionToggle = findViewById(R.id.sessionToggle)
+        guideBtn.setOnClickListener {
+            guideIndex = (guideIndex + 1) % guides.size
+            val guide = guides[guideIndex]
+            overlay.guideAspect = guide.aspect
+            overlay.guideSafeZones = guide.safeZones
+            updateButtons()
+        }
+        sessionToggle.setOnCheckedChangeListener { _, checked -> if (checked) startSession() else endSession() }
+
         ettrToggle = findViewById(R.id.ettrToggle)
         faceToggle = findViewById(R.id.faceToggle)
         sceneToggle = findViewById(R.id.sceneToggle)
@@ -483,9 +514,19 @@ class MainActivity : Activity() {
 
         focusToggle.setOnCheckedChangeListener { _, _ -> syncControls() }
         wbBtn.setOnClickListener {
+            if (sessionLocked) {
+                toast("Desactivá la sesión para cambiar el balance de blancos")
+                return@setOnClickListener
+            }
             wbIndex = (wbIndex + 1) % wbOptions.size
             updateButtons()
             syncControls()
+            if (wbOptions[wbIndex] == Wb.CARD) {
+                awaitingCard = true
+                toast("Tocá la tarjeta gris (o una hoja blanca) en la imagen")
+            } else {
+                awaitingCard = false
+            }
         }
         lensBtn.setOnClickListener { switchLens((lensIndex + 1) % lenses.size) }
 
@@ -698,7 +739,7 @@ class MainActivity : Activity() {
         wbOptions = Wb.values().filter { wb ->
             when (wb) {
                 Wb.AUTO -> true
-                Wb.KELVIN -> manualPost && wb.awb in awbModes
+                Wb.KELVIN, Wb.CARD -> manualPost && wb.awb in awbModes
                 else -> wb.awb in awbModes
             }
         }
@@ -775,6 +816,7 @@ class MainActivity : Activity() {
         wbBtn.text = wbOptions.getOrElse(wbIndex) { Wb.AUTO }.label
         lensBtn.text = "Lente: ${lenses.getOrNull(lensIndex)?.label ?: "-"}"
         lensBtn.isEnabled = lenses.size > 1
+        guideBtn.text = guides[guideIndex].label
         formatBtn.text = saveFormat.label
         qualityBtn.text = "JPEG $jpegQuality%"
         qualityBtn.isEnabled = saveFormat != SaveFormat.RAW
@@ -802,6 +844,14 @@ class MainActivity : Activity() {
     }
 
     private fun focusAt(x: Float, y: Float) {
+        if (awaitingCard && wbMode == Wb.CARD) {
+            measureCard(x, y)
+            return
+        }
+        if (sessionLocked) {
+            toast("Sesión bloqueada: desactivala para reenfocar")
+            return
+        }
         if (maxAfRegions == 0 && maxAeRegions == 0) {
             toast("Esta cámara no admite enfoque por toque")
             return
@@ -816,7 +866,105 @@ class MainActivity : Activity() {
         handler.post { refreshPreview(CaptureRequest.CONTROL_AF_TRIGGER_START) }
     }
 
+    // ---- Grey card & product session (UI thread) ----
+
+    /**
+     * Averages a patch of the preview around the tap, in linear light, and corrects the current
+     * white-balance gains so that patch becomes neutral. The preview already includes the active
+     * gains and colour matrix, so it runs three passes, each refining the previous result.
+     */
+    private fun measureCard(x: Float, y: Float) {
+        val bmp = preview.getBitmap(CARD_SAMPLE_W, CARD_SAMPLE_H) ?: return
+        val cx = (x / preview.width * CARD_SAMPLE_W).toInt()
+        val cy = (y / preview.height * CARD_SAMPLE_H).toInt()
+        val half = (CARD_SAMPLE_W * 0.04f).toInt().coerceAtLeast(3)
+        var r = 0.0
+        var g = 0.0
+        var b = 0.0
+        var n = 0
+        for (yy in (cy - half).coerceAtLeast(0) until (cy + half).coerceAtMost(CARD_SAMPLE_H)) {
+            for (xx in (cx - half).coerceAtLeast(0) until (cx + half).coerceAtMost(CARD_SAMPLE_W)) {
+                val p = bmp.getPixel(xx, yy)
+                r += srgbToLinear((p shr 16) and 0xFF)
+                g += srgbToLinear((p shr 8) and 0xFF)
+                b += srgbToLinear(p and 0xFF)
+                n++
+            }
+        }
+        bmp.recycle()
+        if (n == 0) return
+        r /= n
+        g /= n
+        b /= n
+        if (g < 0.02 || r > 0.95 || g > 0.95 || b > 0.95) {
+            toast("La tarjeta está muy oscura o quemada: ajustá la exposición y tocá de nuevo")
+            return
+        }
+
+        val current = cardGains ?: lastGains ?: RggbChannelVector(2f, 1f, 1f, 2f)
+        val green = (current.greenEven + current.greenOdd) / 2f
+        val newRed = (current.red / green * (g / r)).toFloat().coerceIn(0.3f, 8f)
+        val newBlue = (current.blue / green * (g / b)).toFloat().coerceIn(0.3f, 8f)
+        cardGains = RggbChannelVector(newRed, 1f, 1f, newBlue)
+        handler.post { refreshPreview() }
+
+        val size = focusRing.layoutParams.width
+        focusRing.translationX = x - size / 2f
+        focusRing.translationY = y - size / 2f
+        focusRing.visibility = View.VISIBLE
+
+        cardPass++
+        if (cardPass < CARD_PASSES) {
+            ui.postDelayed({ if (wbMode == Wb.CARD) measureCard(x, y) }, 500)
+        } else {
+            cardPass = 0
+            awaitingCard = false
+            focusRing.visibility = View.GONE
+            toast(String.format(Locale.US, "Balance de tarjeta listo (R %.2f · B %.2f)", newRed, newBlue))
+        }
+    }
+
+    private fun srgbToLinear(v: Int): Double {
+        val c = v / 255.0
+        return if (c <= 0.04045) c / 12.92 else ((c + 0.055) / 1.055).pow(2.4)
+    }
+
+    /**
+     * Freezes everything that could drift between catalogue shots: exposure (switches to Manual
+     * with the metered values), white balance (AWB lock unless a manual WB is in use) and focus
+     * (AF lock unless manual focus). Automatic helpers are turned off.
+     */
+    private fun startSession() {
+        val iso = meteredIso
+        val time = meteredExp
+        if (mode != Mode.MANUAL) {
+            modeGroup.check(R.id.modeManual)
+            isoBar.progress = inverseLogLerp(isoRange.lower.toDouble(), isoRange.upper.toDouble(), iso.toDouble())
+            expBar.progress = inverseLogLerp(expRange.lower.toDouble(), maxExposure.toDouble(), time.toDouble())
+        }
+        ettrToggle.isChecked = false
+        sceneToggle.isChecked = false
+        faceToggle.isChecked = false
+        awaitingCard = false
+        sessionLocked = true
+        lockBadge.text = "SESIÓN PRODUCTO · bloqueada"
+        lockBadge.visibility = View.VISIBLE
+        val lockFocus = !manualFocus
+        locked = true
+        handler.post { refreshPreview(if (lockFocus) CaptureRequest.CONTROL_AF_TRIGGER_START else null) }
+        toast("Sesión: exposición, balance y foco bloqueados")
+    }
+
+    private fun endSession() {
+        sessionLocked = false
+        locked = false
+        lockBadge.text = LOCK_LABEL
+        lockBadge.visibility = View.GONE
+        handler.post { refreshPreview(CaptureRequest.CONTROL_AF_TRIGGER_CANCEL) }
+    }
+
     private fun toggleLock() {
+        if (sessionLocked) return
         locked = !locked
         lockBadge.visibility = if (locked) View.VISIBLE else View.GONE
         preview.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
@@ -825,6 +973,10 @@ class MainActivity : Activity() {
     }
 
     private fun resetFocus() {
+        if (sessionLocked) {
+            toast("Sesión bloqueada: desactivala para cambiar el foco")
+            return
+        }
         focusRegion = null
         locked = false
         focusRing.visibility = View.GONE
@@ -1524,15 +1676,21 @@ class MainActivity : Activity() {
 
     private fun CaptureRequest.Builder.applyWhiteBalance() {
         val transform = lastTransform
-        if (wbMode == Wb.KELVIN && transform != null) {
+        val manualGains = when (wbMode) {
+            Wb.KELVIN -> kelvinGains(kelvin)
+            Wb.CARD -> cardGains
+            else -> null
+        }
+        if (manualGains != null && transform != null) {
             set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
             set(CaptureRequest.COLOR_CORRECTION_MODE, CaptureRequest.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
             set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, transform)
-            set(CaptureRequest.COLOR_CORRECTION_GAINS, kelvinGains(kelvin))
+            set(CaptureRequest.COLOR_CORRECTION_GAINS, manualGains)
         } else {
-            // Kelvin falls back to auto until a color transform has been observed.
-            val awb = if (wbMode == Wb.KELVIN) CaptureRequest.CONTROL_AWB_MODE_AUTO else wbMode.awb
+            // Kelvin and grey card fall back to auto until a colour transform / measurement exists.
+            val awb = if (wbMode.awb == CaptureRequest.CONTROL_AWB_MODE_OFF) CaptureRequest.CONTROL_AWB_MODE_AUTO else wbMode.awb
             set(CaptureRequest.CONTROL_AWB_MODE, awb)
+            if (sessionLocked) set(CaptureRequest.CONTROL_AWB_LOCK, true)
         }
     }
 
@@ -1673,11 +1831,12 @@ class MainActivity : Activity() {
                 meteredIso = iso
                 meteredExp = time
             }
+            result.get(CaptureResult.COLOR_CORRECTION_GAINS)?.let { lastGains = it }
             if (result.get(CaptureResult.CONTROL_AWB_MODE) != CaptureResult.CONTROL_AWB_MODE_OFF) {
                 val transform = result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
                 val firstTransform = lastTransform == null && transform != null
                 if (transform != null) lastTransform = transform
-                if (firstTransform && wbMode == Wb.KELVIN) handler.post { refreshPreview() }
+                if (firstTransform && wbMode.awb == CaptureRequest.CONTROL_AWB_MODE_OFF) handler.post { refreshPreview() }
             }
             val afState = result.get(CaptureResult.CONTROL_AF_STATE)
             afFocused = manualFocus ||
@@ -2148,6 +2307,11 @@ class MainActivity : Activity() {
         private const val HAZE_LIMIT = 0.16f
         private const val CONTRAST_LIMIT = 0.22f
         private const val GLOW_LIMIT = 0.50f
+
+        private const val CARD_SAMPLE_W = 240
+        private const val CARD_SAMPLE_H = 320
+        private const val CARD_PASSES = 3
+        private const val LOCK_LABEL = "AE/AF LOCK"
 
         private const val ETTR_TARGET_BIN = 58
         private const val ETTR_CLIP_MAX = 0.002f
