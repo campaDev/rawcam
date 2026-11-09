@@ -190,6 +190,27 @@ class MainActivity : Activity() {
     private var burstSequence = false
     @Volatile private var bestOnly = false
 
+    private lateinit var ettrToggle: CheckBox
+    private lateinit var faceToggle: CheckBox
+    private lateinit var sceneToggle: CheckBox
+    private lateinit var suggestionChip: TextView
+    private lateinit var astroBadge: TextView
+
+    private var ettrCounter = 0
+    private var candidateKey: String? = null
+    private var candidateCount = 0
+    private var shownSuggestion: Suggestion? = null
+    private var focalMm = 0f
+    private var aperture = 1.8f
+    private var pixelPitchUm = 1.2f
+    @Volatile private var subjectDiopters = 0f
+
+    // Faces: detection mode per camera, and the region 3A follows (written on the camera thread).
+    private var faceMode = CameraCharacteristics.STATISTICS_FACE_DETECT_MODE_OFF
+    @Volatile private var useFaces = true
+    @Volatile private var faceRegion: MeteringRectangle? = null
+    private var lastFaceRefresh = 0L
+
     @Volatile private var afFocused = false
     private var focusCalibrated = false
     private var dirtyScore = 0f
@@ -342,6 +363,31 @@ class MainActivity : Activity() {
         locationToggle = findViewById(R.id.locationToggle)
         intervalBtn = findViewById(R.id.intervalBtn)
         shotsBtn = findViewById(R.id.shotsBtn)
+        ettrToggle = findViewById(R.id.ettrToggle)
+        faceToggle = findViewById(R.id.faceToggle)
+        sceneToggle = findViewById(R.id.sceneToggle)
+        suggestionChip = findViewById(R.id.suggestionChip)
+        astroBadge = findViewById(R.id.astroBadge)
+
+        ettrToggle.setOnCheckedChangeListener { _, _ -> syncControls() }
+        faceToggle.setOnCheckedChangeListener { _, checked ->
+            useFaces = checked
+            if (!checked) {
+                overlay.setFaces(emptyList())
+                handler.post {
+                    faceRegion = null
+                    refreshPreview()
+                }
+            } else {
+                handler.post { refreshPreview() }
+            }
+        }
+        sceneToggle.setOnCheckedChangeListener { _, checked ->
+            if (!checked) suggestionChip.visibility = View.GONE
+        }
+        suggestionChip.setOnClickListener { applySuggestion() }
+        astroBadge.setOnClickListener { applyAstro() }
+
         steadyToggle = findViewById(R.id.steadyToggle)
         bestToggle = findViewById(R.id.bestToggle)
         bestToggle.setOnCheckedChangeListener { _, checked -> bestOnly = checked }
@@ -456,6 +502,7 @@ class MainActivity : Activity() {
         driveBtn.setOnClickListener {
             driveIndex = (driveIndex + 1) % drives.size
             updateButtons()
+            updateAstro(-1)
         }
         timerBtn.setOnClickListener {
             timerIndex = (timerIndex + 1) % timers.size
@@ -659,12 +706,18 @@ class MainActivity : Activity() {
         nrModes = chars.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES)?.toSet() ?: emptySet()
         focusCalibrated = chars.get(CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION) !=
             CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION_UNCALIBRATED
-        val focalMm = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: 0f
+        focalMm = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: 0f
+        aperture = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES)?.firstOrNull() ?: 1.8f
         val physical = chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
         val pixelArray = chars.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
-        focalPx = if (physical != null && pixelArray != null && physical.width > 0f) {
-            focalMm * pixelArray.width / physical.width
-        } else 0f
+        if (physical != null && pixelArray != null && physical.width > 0f) {
+            focalPx = focalMm * pixelArray.width / physical.width
+            pixelPitchUm = physical.width * 1000f / pixelArray.width
+        } else {
+            focalPx = 0f
+        }
+        val faceModes = chars.get(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_FACE_DETECT_MODES)
+        faceMode = faceModes?.maxOrNull() ?: CameraCharacteristics.STATISTICS_FACE_DETECT_MODE_OFF
         isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)!!
         expRange = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)!!
         evRange = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE) ?: Range(0, 0)
@@ -681,7 +734,7 @@ class MainActivity : Activity() {
     private fun syncControls() {
         isoBar.isEnabled = mode == Mode.ISO || mode == Mode.MANUAL
         expBar.isEnabled = mode == Mode.SHUTTER || mode == Mode.MANUAL
-        evBar.isEnabled = mode != Mode.MANUAL
+        evBar.isEnabled = mode != Mode.MANUAL && !ettrToggle.isChecked
 
         isoValue = logLerp(isoRange.lower.toDouble(), isoRange.upper.toDouble(), isoBar.progress / 1000.0).roundToInt()
         expValue = logLerp(expRange.lower.toDouble(), maxExposure.toDouble(), expBar.progress / 1000.0).toLong()
@@ -987,8 +1040,11 @@ class MainActivity : Activity() {
         updateShutterIdle()
     }
 
+    private fun astroSelected() = drives[driveIndex].infinity
+
     private fun needsAnalysis() =
-        histToggle.isChecked || zebraToggle.isChecked || peakToggle.isChecked || lensToggle.isChecked
+        histToggle.isChecked || zebraToggle.isChecked || peakToggle.isChecked || lensToggle.isChecked ||
+            ettrToggle.isChecked || sceneToggle.isChecked || astroSelected()
 
     private val grabTick = object : Runnable {
         override fun run() {
@@ -1000,9 +1056,10 @@ class MainActivity : Activity() {
                 val zebra = zebraToggle.isChecked
                 val peak = peakToggle.isChecked
                 val lensCheck = lensToggle.isChecked
+                val astro = astroSelected()
                 analysisHandler.post {
                     try {
-                        analyze(hist, zebra, peak, lensCheck)
+                        analyze(hist, zebra, peak, lensCheck, astro)
                     } finally {
                         analyzing = false
                     }
@@ -1013,12 +1070,13 @@ class MainActivity : Activity() {
     }
 
     /** Luma histogram, diagonal-stripe zebras on clipped pixels and gradient-based focus peaking. */
-    private fun analyze(hist: Boolean, zebra: Boolean, peak: Boolean, lensCheck: Boolean) {
+    private fun analyze(hist: Boolean, zebra: Boolean, peak: Boolean, lensCheck: Boolean, astro: Boolean) {
         val w = ANALYSIS_W
         val h = ANALYSIS_H
         val bins = IntArray(HIST_BINS)
         val useMask = zebra || peak
         if (useMask) maskPixels.fill(0)
+        var lumaTotal = 0L
 
         for (y in 0 until h) {
             for (x in 0 until w) {
@@ -1029,6 +1087,7 @@ class MainActivity : Activity() {
                 val b = p and 0xFF
                 val l = (r * 77 + g * 150 + b * 29) shr 8
                 luma[i] = l
+                lumaTotal += l
                 bins[l * HIST_BINS / 256]++
                 if (zebra && (r >= ZEBRA_LEVEL || g >= ZEBRA_LEVEL || b >= ZEBRA_LEVEL) && ((x + y) / 6) % 2 == 0) {
                     maskPixels[i] = ZEBRA_COLOR
@@ -1055,11 +1114,169 @@ class MainActivity : Activity() {
         }
         val histogram = if (hist) bins else null
         val lens = if (lensCheck) lensStats(w, h) else null
+        val stars = if (astro) countStars(w, h, (lumaTotal / (w * h)).toInt()) else -1
         runOnUiThread {
             if (needsAnalysis()) overlay.setAnalysis(histogram, if (zebra || peak) mask else null)
             if (lens != null && lensToggle.isChecked) onLensStats(lens)
+            ettrStep(bins)
+            sceneStep(bins)
+            updateAstro(stars)
         }
     }
+
+    /** Point sources: local maxima clearly above the mean, counted once per 3×3 neighbourhood. */
+    private fun countStars(w: Int, h: Int, mean: Int): Int {
+        val threshold = maxOf(STAR_MIN_LUMA, mean + STAR_ABOVE_MEAN)
+        var count = 0
+        for (y in 2 until h - 2) {
+            for (x in 2 until w - 2) {
+                val i = y * w + x
+                val v = luma[i]
+                if (v < threshold) continue
+                if (v > luma[i - 1] && v >= luma[i + 1] && v > luma[i - w] && v >= luma[i + w] &&
+                    v - luma[i - 2] > STAR_CONTRAST && v - luma[i + 2] > STAR_CONTRAST
+                ) count++
+            }
+        }
+        return count
+    }
+
+    // ---- ETTR, scene suggestions, astro assistant (UI thread) ----
+
+    /**
+     * Expose-to-the-right: nudges EV compensation one step at a time so the brightest 0.5% sits
+     * just below clipping. Gives the RAW the most signal (least noise) without blown highlights.
+     */
+    private fun ettrStep(bins: IntArray) {
+        if (!ettrToggle.isChecked || mode == Mode.MANUAL || busy) return
+        if (++ettrCounter % 2 != 0) return
+        val total = bins.sum().coerceAtLeast(1)
+        val clipped = bins[HIST_BINS - 1].toFloat() / total
+        val bright = percentile(bins, 0.995)
+        val step = when {
+            clipped > ETTR_CLIP_MAX -> -1
+            bright < ETTR_TARGET_BIN -> 1
+            else -> 0
+        }
+        if (step == 0) return
+        val next = (evBar.progress + step).coerceIn(0, evBar.max)
+        if (next != evBar.progress) evBar.progress = next
+    }
+
+    private class Suggestion(val text: String, val apply: () -> Unit)
+
+    private fun driveNamed(prefix: String) = drives.indexOfFirst { it.label.startsWith(prefix) }
+
+    private fun pickSuggestion(bins: IntArray): Suggestion? {
+        val total = bins.sum().coerceAtLeast(1).toFloat()
+        val highs = (bins[HIST_BINS - 1] + bins[HIST_BINS - 2]) / total
+        val shadows = (bins[0] + bins[1] + bins[2] + bins[3]) / total
+        val iso = meteredIso
+        val time = meteredExp
+        val auto = mode != Mode.MANUAL
+
+        fun drive(prefix: String, text: String, extra: () -> Unit = {}): Suggestion? {
+            val idx = driveNamed(prefix)
+            if (idx < 0 || idx == driveIndex) return null
+            return Suggestion(text) {
+                driveIndex = idx
+                extra()
+                updateButtons()
+            }
+        }
+
+        return when {
+            auto && time >= 250_000_000L && iso >= isoRange.upper * 0.7 ->
+                drive("Astro ×16", "🌙 Muy oscuro → Astro ×16 con trípode")
+            auto && (iso >= 1600 || time >= 66_000_000L) && gyroRms < STABLE_RMS ->
+                drive("Promedio ×16", "🌆 Poca luz y apoyado → Promedio ×16")
+            auto && (iso >= 1600 || time >= 66_000_000L) ->
+                drive("Ráfaga ×8", "✋ Poca luz a pulso → Ráfaga ×8 + solo la mejor") { bestToggle.isChecked = true }
+            highs > 0.02f && shadows > 0.15f ->
+                drive("Bracket ±2 ×3", "☀️ Contraluz → Bracket ±2 ×3")
+            subjectDiopters > 6f && !manualFocus && minFocusDiopters > 0f ->
+                Suggestion("🔍 Primer plano → foco manual + peaking") {
+                    focusToggle.isChecked = true
+                    peakToggle.isChecked = true
+                }
+            else -> null
+        }
+    }
+
+    /** Shows a suggestion only after it has held steady for ~1.5 s, so it doesn't flicker. */
+    private fun sceneStep(bins: IntArray) {
+        if (!sceneToggle.isChecked || busy || waitingSteady || intervalRunning) {
+            suggestionChip.visibility = View.GONE
+            shownSuggestion = null
+            return
+        }
+        val candidate = pickSuggestion(bins)
+        val key = candidate?.text
+        if (key == candidateKey) candidateCount++ else {
+            candidateKey = key
+            candidateCount = 1
+        }
+        if (candidateCount < SUGGESTION_HOLD) return
+        shownSuggestion = candidate
+        if (candidate == null) {
+            suggestionChip.visibility = View.GONE
+        } else {
+            suggestionChip.text = "${candidate.text}  · tocá para aplicar"
+            suggestionChip.visibility = View.VISIBLE
+        }
+    }
+
+    private fun applySuggestion() {
+        shownSuggestion?.apply?.invoke()
+        shownSuggestion = null
+        candidateKey = null
+        candidateCount = 0
+        suggestionChip.visibility = View.GONE
+    }
+
+    /** NPF rule (seconds): longest exposure before stars visibly trail, from aperture, pixel pitch and focal. */
+    private fun npfSeconds(): Double =
+        if (focalMm > 0f) (35.0 * aperture + 30.0 * pixelPitchUm) / (focalMm * zoomRatio) else 0.0
+
+    private fun updateAstro(stars: Int) {
+        val drive = drives[driveIndex]
+        if (!drive.infinity) {
+            astroBadge.visibility = View.GONE
+            return
+        }
+        val npf = npfSeconds()
+        val frameS = (if (mode == Mode.MANUAL) expValue else meteredExp) / 1e9
+        val totalS = frameS * drive.evs.size
+        // Sky drift at the celestial equator: 7.29e-5 rad/s projected through the lens.
+        val driftPx = 7.29e-5 * totalS * focalPx * zoomRatio
+        val sb = StringBuilder()
+        sb.append(String.format(Locale.US, "Astro · NPF: máx %.1f s por cuadro", npf))
+        if (frameS > npf) sb.append("  ⚠ trazos")
+        sb.append(String.format(Locale.US, "\nTotal %d × %s = %.0f s · deriva ≈ %.0f px",
+            drive.evs.size, formatExposure((frameS * 1e9).toLong()), totalS, driftPx))
+        if (driftPx > 3) sb.append("  ⚠ sin alinear habrá trazos")
+        if (stars >= 0) sb.append("\nEstrellas en el visor: $stars")
+        sb.append("\nTocá para aplicar ajustes astro")
+        astroBadge.text = sb.toString()
+        astroBadge.visibility = View.VISIBLE
+    }
+
+    /** Manual mode, ISO 1600 and the NPF exposure (capped by the sensor), with focus forced to ∞ by the drive. */
+    private fun applyAstro() {
+        val npfNs = (npfSeconds() * 1e9).toLong().coerceIn(expRange.lower, maxExposure)
+        val iso = ASTRO_ISO.coerceIn(isoRange.lower, isoRange.upper)
+        modeGroup.check(R.id.modeManual)
+        isoBar.progress = inverseLogLerp(isoRange.lower.toDouble(), isoRange.upper.toDouble(), iso.toDouble())
+        expBar.progress = inverseLogLerp(expRange.lower.toDouble(), maxExposure.toDouble(), npfNs.toDouble())
+        if (timers[timerIndex] == 0) {
+            timerIndex = timers.indexOf(2).coerceAtLeast(0)
+            updateButtons()
+        }
+        toast("Astro: Manual, ISO $iso, ${formatExposure(npfNs)}, timer 2 s")
+    }
+
+    private fun inverseLogLerp(lo: Double, hi: Double, v: Double): Int =
+        ((ln(v) - ln(lo)) / (ln(hi) - ln(lo)) * 1000).roundToInt().coerceIn(0, 1000)
 
     /**
      * Heuristic smudge metrics on the downscaled preview:
@@ -1337,18 +1554,75 @@ class MainActivity : Activity() {
         return RggbChannelVector(rGain, 1f, 1f, bGain)
     }
 
+    /** Priority: manual focus > tapped point (single AF) > detected face (continuous AF) > scene. */
     private fun CaptureRequest.Builder.applyFocus() {
-        val region = focusRegion
+        val tap = focusRegion
+        val face = if (useFaces) faceRegion else null
         if (manualFocus) {
             set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
             set(CaptureRequest.LENS_FOCUS_DISTANCE, focusDiopters)
-        } else if (region != null && maxAfRegions > 0) {
+        } else if (tap != null && maxAfRegions > 0) {
             set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
-            set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
+            set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(tap))
         } else {
             set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            if (face != null && maxAfRegions > 0) set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(face))
         }
-        if (region != null && maxAeRegions > 0) set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
+        val metering = tap ?: face
+        if (metering != null && maxAeRegions > 0) set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(metering))
+        if (useFaces && faceMode != CameraCharacteristics.STATISTICS_FACE_DETECT_MODE_OFF) {
+            set(CaptureRequest.STATISTICS_FACE_DETECT_MODE, faceMode)
+        }
+    }
+
+    // ---- Faces (camera thread) ----
+
+    private fun handleFaces(faces: Array<android.hardware.camera2.params.Face>?) {
+        val valid = faces?.filter { it.score >= FACE_MIN_SCORE } ?: emptyList()
+        val best = valid.maxByOrNull { it.bounds.width() * it.bounds.height() }
+        val next = best?.let { MeteringRectangle(clampToActive(it.bounds), MeteringRectangle.METERING_WEIGHT_MAX - 1) }
+        val now = android.os.SystemClock.uptimeMillis()
+        if (regionMoved(faceRegion, next) && now - lastFaceRefresh > FACE_REFRESH_MS) {
+            faceRegion = next
+            lastFaceRefresh = now
+            if (focusRegion == null && !manualFocus) refreshPreview()
+        }
+        if (frameCount % 3 == 0) {
+            val rects = valid.map { toViewRect(it.bounds) }
+            runOnUiThread { overlay.setFaces(if (faceToggle.isChecked) rects else emptyList()) }
+        }
+    }
+
+    private fun clampToActive(r: Rect): Rect {
+        val w = activeArray.width()
+        val h = activeArray.height()
+        val left = r.left.coerceIn(0, w - 2)
+        val top = r.top.coerceIn(0, h - 2)
+        return Rect(left, top, r.right.coerceIn(left + 1, w), r.bottom.coerceIn(top + 1, h))
+    }
+
+    private fun regionMoved(a: MeteringRectangle?, b: MeteringRectangle?): Boolean {
+        if (a == null || b == null) return (a == null) != (b == null)
+        val tolerance = activeArray.width() * 0.05f
+        val dx = abs((a.x + a.width / 2f) - (b.x + b.width / 2f))
+        val dy = abs((a.y + a.height / 2f) - (b.y + b.height / 2f))
+        val sizeChange = abs(a.width - b.width) / a.width.toFloat()
+        return dx > tolerance || dy > tolerance || sizeChange > 0.2f
+    }
+
+    /** Inverse of [regionFor]: sensor rectangle → normalised portrait-preview rectangle. */
+    private fun toViewRect(r: Rect): android.graphics.RectF {
+        val w = activeArray.width().toFloat()
+        val h = activeArray.height().toFloat()
+        fun map(sx: Float, sy: Float): Pair<Float, Float> = when (sensorOrientation) {
+            90 -> (1f - sy) to sx
+            180 -> (1f - sx) to (1f - sy)
+            270 -> sy to (1f - sx)
+            else -> sx to sy
+        }
+        val (ax, ay) = map(r.left / w, r.top / h)
+        val (bx, by) = map(r.right / w, r.bottom / h)
+        return android.graphics.RectF(min(ax, bx), min(ay, by), maxOf(ax, bx), maxOf(ay, by))
     }
 
     /**
@@ -1409,6 +1683,8 @@ class MainActivity : Activity() {
             afFocused = manualFocus ||
                 afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED ||
                 afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
+            subjectDiopters = result.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: 0f
+            if (useFaces) handleFaces(result.get(CaptureResult.STATISTICS_FACES))
 
             if (frameCount++ % 10 != 0) return
             val shot = baseExposure()
@@ -1872,6 +2148,16 @@ class MainActivity : Activity() {
         private const val HAZE_LIMIT = 0.16f
         private const val CONTRAST_LIMIT = 0.22f
         private const val GLOW_LIMIT = 0.50f
+
+        private const val ETTR_TARGET_BIN = 58
+        private const val ETTR_CLIP_MAX = 0.002f
+        private const val SUGGESTION_HOLD = 12
+        private const val ASTRO_ISO = 1600
+        private const val STAR_MIN_LUMA = 50
+        private const val STAR_ABOVE_MEAN = 30
+        private const val STAR_CONTRAST = 25
+        private const val FACE_MIN_SCORE = 50
+        private const val FACE_REFRESH_MS = 500L
 
         private const val GYRO_WINDOW = 50
         private const val GYRO_NOISE_FLOOR = 0.002f

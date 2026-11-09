@@ -6,6 +6,7 @@ import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.Rect
+import android.graphics.RectF
 import android.util.AttributeSet
 import android.view.View
 import kotlin.math.abs
@@ -25,6 +26,7 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
     private var histogram: IntArray? = null
     private var mask: Bitmap? = null
     private var levelDeg = 0f
+    private var faces: List<RectF> = emptyList()
 
     private val density = resources.displayMetrics.density
     private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -36,12 +38,24 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
     private val histBg = Paint().apply { color = 0x99000000.toInt() }
     private val histPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xDDFFFFFF.toInt() }
     private val clipPaint = Paint().apply { color = 0xFFFF3030.toInt() }
+    private val facePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2f * density
+        color = 0xFF4FC3F7.toInt()
+    }
     private val dst = Rect()
     private val histPath = Path()
 
     fun setAnalysis(hist: IntArray?, mask: Bitmap?) {
         histogram = hist
         this.mask = mask
+        invalidate()
+    }
+
+    /** Face rectangles in normalised (0–1) preview coordinates. */
+    fun setFaces(rects: List<RectF>) {
+        if (rects.isEmpty() && faces.isEmpty()) return
+        faces = rects
         invalidate()
     }
 
@@ -54,6 +68,9 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
         mask?.let {
             dst.set(0, 0, width, height)
             canvas.drawBitmap(it, null, dst, maskPaint)
+        }
+        for (f in faces) {
+            canvas.drawRect(f.left * width, f.top * height, f.right * width, f.bottom * height, facePaint)
         }
         if (showGrid) drawGrid(canvas)
         histogram?.let { drawHistogram(canvas, it) }
