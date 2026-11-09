@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ContentValues
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.SurfaceTexture
@@ -17,6 +18,10 @@ import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.DngCreator
 import android.hardware.camera2.TotalCaptureResult
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.hardware.camera2.params.MeteringRectangle
 import android.media.ExifInterface
 import android.media.Image
@@ -38,6 +43,7 @@ import android.view.Surface
 import android.view.TextureView
 import android.view.View
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.FrameLayout
 import android.widget.RadioGroup
 import android.widget.SeekBar
@@ -47,6 +53,8 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
+import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.min
@@ -89,6 +97,25 @@ class MainActivity : Activity() {
     private lateinit var timerBtn: Button
     private lateinit var resetBtn: Button
     private lateinit var shutter: Button
+    private lateinit var overlay: OverlayView
+    private lateinit var histToggle: CheckBox
+    private lateinit var zebraToggle: CheckBox
+    private lateinit var peakToggle: CheckBox
+    private lateinit var gridToggle: CheckBox
+
+    private val sensors by lazy { getSystemService(SensorManager::class.java) }
+    private var levelDeg = 0f
+
+    // Viewfinder analysis: a downscaled copy of the preview is analysed off the UI thread.
+    private val analysisThread = HandlerThread("analysis").apply { start() }
+    private val analysisHandler = Handler(analysisThread.looper)
+    private val grabBitmap = Bitmap.createBitmap(ANALYSIS_W, ANALYSIS_H, Bitmap.Config.ARGB_8888)
+    private val pixels = IntArray(ANALYSIS_W * ANALYSIS_H)
+    private val luma = IntArray(ANALYSIS_W * ANALYSIS_H)
+    private val maskPixels = IntArray(ANALYSIS_W * ANALYSIS_H)
+    private val maskBitmaps = Array(2) { Bitmap.createBitmap(ANALYSIS_W, ANALYSIS_H, Bitmap.Config.ARGB_8888) }
+    private var maskIndex = 0
+    @Volatile private var analyzing = false
 
     private val manager by lazy { getSystemService(CameraManager::class.java) }
     private val thread = HandlerThread("camera").apply { start() }
@@ -163,6 +190,19 @@ class MainActivity : Activity() {
         timerBtn = findViewById(R.id.timerBtn)
         resetBtn = findViewById(R.id.resetBtn)
         shutter = findViewById(R.id.shutter)
+        overlay = findViewById(R.id.overlay)
+        histToggle = findViewById(R.id.histToggle)
+        zebraToggle = findViewById(R.id.zebraToggle)
+        peakToggle = findViewById(R.id.peakToggle)
+        gridToggle = findViewById(R.id.gridToggle)
+
+        gridToggle.setOnCheckedChangeListener { _, checked -> overlay.showGrid = checked }
+        val analysisToggle = { _: android.widget.CompoundButton, _: Boolean ->
+            if (!needsAnalysis()) overlay.setAnalysis(null, null)
+        }
+        histToggle.setOnCheckedChangeListener(analysisToggle)
+        zebraToggle.setOnCheckedChangeListener(analysisToggle)
+        peakToggle.setOnCheckedChangeListener(analysisToggle)
 
         previewFrame.layoutParams = previewFrame.layoutParams.apply {
             height = resources.displayMetrics.widthPixels * 4 / 3
@@ -214,6 +254,10 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        sensors.getDefaultSensor(Sensor.TYPE_GRAVITY)?.let {
+            sensors.registerListener(levelListener, it, SensorManager.SENSOR_DELAY_UI)
+        }
+        ui.post(grabTick)
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             if (!askedPermission) {
                 askedPermission = true
@@ -230,6 +274,8 @@ class MainActivity : Activity() {
     }
 
     override fun onPause() {
+        sensors.unregisterListener(levelListener)
+        ui.removeCallbacks(grabTick)
         cancelCountdown()
         shutter.isEnabled = true
         shutter.text = SHUTTER_LABEL
@@ -239,6 +285,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         thread.quitSafely()
+        analysisThread.quitSafely()
         io.shutdown()
         super.onDestroy()
     }
@@ -415,6 +462,89 @@ class MainActivity : Activity() {
         counting = false
         countdownLeft = 0
         countdownText.visibility = View.GONE
+    }
+
+    // ---- Viewfinder aids ----
+
+    private val levelListener = object : SensorEventListener {
+        override fun onSensorChanged(e: SensorEvent) {
+            val raw = Math.toDegrees(atan2(e.values[0].toDouble(), e.values[1].toDouble())).toFloat()
+            var delta = raw - levelDeg
+            if (delta > 180f) delta -= 360f
+            if (delta < -180f) delta += 360f
+            levelDeg += delta * 0.2f
+            overlay.setLevel(levelDeg)
+        }
+
+        override fun onAccuracyChanged(s: Sensor, accuracy: Int) {}
+    }
+
+    private fun needsAnalysis() = histToggle.isChecked || zebraToggle.isChecked || peakToggle.isChecked
+
+    private val grabTick = object : Runnable {
+        override fun run() {
+            if (needsAnalysis() && preview.isAvailable && !analyzing) {
+                preview.getBitmap(grabBitmap)
+                grabBitmap.getPixels(pixels, 0, ANALYSIS_W, 0, 0, ANALYSIS_W, ANALYSIS_H)
+                analyzing = true
+                val hist = histToggle.isChecked
+                val zebra = zebraToggle.isChecked
+                val peak = peakToggle.isChecked
+                analysisHandler.post {
+                    try {
+                        analyze(hist, zebra, peak)
+                    } finally {
+                        analyzing = false
+                    }
+                }
+            }
+            ui.postDelayed(this, ANALYSIS_INTERVAL_MS)
+        }
+    }
+
+    /** Luma histogram, diagonal-stripe zebras on clipped pixels and gradient-based focus peaking. */
+    private fun analyze(hist: Boolean, zebra: Boolean, peak: Boolean) {
+        val w = ANALYSIS_W
+        val h = ANALYSIS_H
+        val bins = IntArray(HIST_BINS)
+        val useMask = zebra || peak
+        if (useMask) maskPixels.fill(0)
+
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val i = y * w + x
+                val p = pixels[i]
+                val r = (p shr 16) and 0xFF
+                val g = (p shr 8) and 0xFF
+                val b = p and 0xFF
+                val l = (r * 77 + g * 150 + b * 29) shr 8
+                luma[i] = l
+                bins[l * HIST_BINS / 256]++
+                if (zebra && (r >= ZEBRA_LEVEL || g >= ZEBRA_LEVEL || b >= ZEBRA_LEVEL) && ((x + y) / 6) % 2 == 0) {
+                    maskPixels[i] = ZEBRA_COLOR
+                }
+            }
+        }
+
+        if (peak) {
+            for (y in 1 until h - 1) {
+                for (x in 1 until w - 1) {
+                    val i = y * w + x
+                    val gx = luma[i + 1] - luma[i - 1]
+                    val gy = luma[i + w] - luma[i - w]
+                    if (abs(gx) + abs(gy) > PEAK_THRESHOLD) maskPixels[i] = PEAK_COLOR
+                }
+            }
+        }
+
+        var mask: Bitmap? = null
+        if (useMask) {
+            mask = maskBitmaps[maskIndex]
+            mask.setPixels(maskPixels, 0, w, 0, 0, w, h)
+            maskIndex = 1 - maskIndex
+        }
+        val histogram = if (hist) bins else null
+        runOnUiThread { if (needsAnalysis()) overlay.setAnalysis(histogram, mask) }
     }
 
     // ---- Exposure ----
@@ -834,5 +964,13 @@ class MainActivity : Activity() {
         private const val PREVIEW_MAX_EXPOSURE_NS = 33_333_333L
         private const val MAX_IN_FLIGHT = 3
         private const val SHUTTER_LABEL = "Capturar"
+        private const val ANALYSIS_W = 360
+        private const val ANALYSIS_H = 480
+        private const val ANALYSIS_INTERVAL_MS = 125L
+        private const val HIST_BINS = 64
+        private const val ZEBRA_LEVEL = 250
+        private const val PEAK_THRESHOLD = 56
+        private const val ZEBRA_COLOR = 0xB0FF3030.toInt()
+        private const val PEAK_COLOR = 0xFF00E5FF.toInt()
     }
 }
