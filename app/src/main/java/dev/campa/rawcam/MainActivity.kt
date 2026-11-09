@@ -156,6 +156,17 @@ class MainActivity : Activity() {
     private lateinit var locationToggle: CheckBox
     private lateinit var intervalBtn: Button
     private lateinit var shotsBtn: Button
+    private lateinit var lensToggle: CheckBox
+    private lateinit var distanceToggle: CheckBox
+    private lateinit var distanceBadge: TextView
+    private lateinit var lensWarning: TextView
+    private lateinit var lensDebug: TextView
+
+    private class LensStats(val haze: Float, val contrast: Float, val glow: Float, val meanLuma: Float)
+
+    @Volatile private var afFocused = false
+    private var focusCalibrated = false
+    private var dirtyScore = 0f
 
     // Intervalometer (UI thread), with the shot number read by the camera thread for naming.
     private var intervalIndex = 0
@@ -305,6 +316,23 @@ class MainActivity : Activity() {
         locationToggle = findViewById(R.id.locationToggle)
         intervalBtn = findViewById(R.id.intervalBtn)
         shotsBtn = findViewById(R.id.shotsBtn)
+        lensToggle = findViewById(R.id.lensToggle)
+        distanceToggle = findViewById(R.id.distanceToggle)
+        distanceBadge = findViewById(R.id.distanceBadge)
+        lensWarning = findViewById(R.id.lensWarning)
+        lensDebug = findViewById(R.id.lensDebug)
+
+        lensToggle.setOnCheckedChangeListener { _, checked ->
+            if (!checked) {
+                dirtyScore = 0f
+                lensWarning.visibility = View.GONE
+                lensDebug.visibility = View.GONE
+            }
+            if (!needsAnalysis()) overlay.setAnalysis(null, null)
+        }
+        distanceToggle.setOnCheckedChangeListener { _, checked ->
+            if (!checked) distanceBadge.visibility = View.GONE
+        }
 
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         intervalBtn.setOnClickListener {
@@ -595,6 +623,8 @@ class MainActivity : Activity() {
         }
         lastTransform = null
         nrModes = chars.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES)?.toSet() ?: emptySet()
+        focusCalibrated = chars.get(CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION) !=
+            CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION_UNCALIBRATED
         isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)!!
         expRange = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)!!
         evRange = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE) ?: Range(0, 0)
@@ -835,7 +865,8 @@ class MainActivity : Activity() {
         override fun onAccuracyChanged(s: Sensor, accuracy: Int) {}
     }
 
-    private fun needsAnalysis() = histToggle.isChecked || zebraToggle.isChecked || peakToggle.isChecked
+    private fun needsAnalysis() =
+        histToggle.isChecked || zebraToggle.isChecked || peakToggle.isChecked || lensToggle.isChecked
 
     private val grabTick = object : Runnable {
         override fun run() {
@@ -846,9 +877,10 @@ class MainActivity : Activity() {
                 val hist = histToggle.isChecked
                 val zebra = zebraToggle.isChecked
                 val peak = peakToggle.isChecked
+                val lensCheck = lensToggle.isChecked
                 analysisHandler.post {
                     try {
-                        analyze(hist, zebra, peak)
+                        analyze(hist, zebra, peak, lensCheck)
                     } finally {
                         analyzing = false
                     }
@@ -859,7 +891,7 @@ class MainActivity : Activity() {
     }
 
     /** Luma histogram, diagonal-stripe zebras on clipped pixels and gradient-based focus peaking. */
-    private fun analyze(hist: Boolean, zebra: Boolean, peak: Boolean) {
+    private fun analyze(hist: Boolean, zebra: Boolean, peak: Boolean, lensCheck: Boolean) {
         val w = ANALYSIS_W
         val h = ANALYSIS_H
         val bins = IntArray(HIST_BINS)
@@ -900,7 +932,135 @@ class MainActivity : Activity() {
             maskIndex = 1 - maskIndex
         }
         val histogram = if (hist) bins else null
-        runOnUiThread { if (needsAnalysis()) overlay.setAnalysis(histogram, mask) }
+        val lens = if (lensCheck) lensStats(w, h) else null
+        runOnUiThread {
+            if (needsAnalysis()) overlay.setAnalysis(histogram, if (zebra || peak) mask else null)
+            if (lens != null && lensToggle.isChecked) onLensStats(lens)
+        }
+    }
+
+    /**
+     * Heuristic smudge metrics on the downscaled preview:
+     *  - haze: 10th percentile of the 8×8-block dark channel (min RGB). A greasy lens adds veiling
+     *    light, so even the darkest regions stop reaching black.
+     *  - contrast: strongest edges relative to the tonal range. Smudges soften every edge.
+     *  - glow: brightness 20 px away from clipped point lights whose surroundings (48 px) are dark.
+     *    A clean lens falls off fast; a smudged one spreads a halo. Negative when not measurable.
+     */
+    private fun lensStats(w: Int, h: Int): LensStats {
+        val bs = 8
+        val bw = w / bs
+        val bh = h / bs
+        val dark = IntArray(bw * bh) { 255 }
+        val lumaHist = IntArray(256)
+        val gradHist = IntArray(511)
+        var lumaSum = 0L
+
+        for (y in 0 until h) {
+            val by = (y / bs).coerceAtMost(bh - 1)
+            for (x in 0 until w) {
+                val i = y * w + x
+                val p = pixels[i]
+                val mn = min(min((p shr 16) and 0xFF, (p shr 8) and 0xFF), p and 0xFF)
+                val bi = by * bw + (x / bs).coerceAtMost(bw - 1)
+                if (mn < dark[bi]) dark[bi] = mn
+                val l = luma[i]
+                lumaHist[l]++
+                lumaSum += l
+                if (x in 1 until w - 1 && y in 1 until h - 1) {
+                    gradHist[abs(luma[i + 1] - luma[i - 1]) + abs(luma[i + w] - luma[i - w])]++
+                }
+            }
+        }
+
+        dark.sort()
+        val haze = dark[dark.size / 10] / 255f
+        val range = percentile(lumaHist, 0.99) - percentile(lumaHist, 0.01) + 1f
+        val contrast = percentile(gradHist, 0.995) / (2f * range)
+
+        var glowSum = 0f
+        var glowCount = 0
+        val near = 20
+        val far = 48
+        val dirs = intArrayOf(1, -1, w, -w)
+        var y = far
+        while (y < h - far) {
+            var x = far
+            while (x < w - far) {
+                val i = y * w + x
+                if (luma[i] >= 250) {
+                    for (d in dirs) {
+                        if (luma[i + d * far] < 60) {
+                            glowSum += luma[i + d * near]
+                            glowCount++
+                        }
+                    }
+                }
+                x += 4
+            }
+            y += 4
+        }
+        val glow = if (glowCount >= 20) glowSum / glowCount / 255f else -1f
+
+        return LensStats(haze, contrast, glow, lumaSum.toFloat() / (w * h) / 255f)
+    }
+
+    private fun percentile(hist: IntArray, q: Double): Int {
+        val target = (hist.sum() * q).toLong()
+        var acc = 0L
+        for (i in hist.indices) {
+            acc += hist[i]
+            if (acc >= target) return i
+        }
+        return hist.size - 1
+    }
+
+    /** Smooths per-frame verdicts over a few seconds, with hysteresis, before warning. */
+    private fun onLensStats(s: LensStats) {
+        lensDebug.visibility = View.VISIBLE
+        val glowText = if (s.glow < 0) "-" else String.format(Locale.US, "%.2f", s.glow)
+        lensDebug.text = String.format(Locale.US, "velo %.2f · contraste %.2f · halo %s", s.haze, s.contrast, glowText)
+
+        // Skip frames that can't be judged: too dark, or not in focus (blur would look like a smudge).
+        if (s.meanLuma < 0.08f || !afFocused) return
+
+        val hazy = s.haze > HAZE_LIMIT && s.contrast < CONTRAST_LIMIT
+        val glowy = s.glow > GLOW_LIMIT
+        val verdict = if (hazy || glowy) 1f else 0f
+        dirtyScore += (verdict - dirtyScore) * 0.08f
+
+        if (dirtyScore > 0.6f) {
+            val reason = when {
+                hazy && glowy -> "velo y halos"
+                glowy -> "halos en las luces"
+                else -> "imagen lechosa"
+            }
+            lensWarning.text = "⚠ Lente posiblemente sucio ($reason) — limpialo"
+            lensWarning.visibility = View.VISIBLE
+        } else if (dirtyScore < 0.3f) {
+            lensWarning.visibility = View.GONE
+        }
+    }
+
+    private fun formatDistance(m: Float): String = when {
+        m >= 20f -> "∞"
+        m >= 10f -> String.format(Locale.US, "%.0f m", m)
+        m >= 1f -> String.format(Locale.US, "%.1f m", m)
+        else -> String.format(Locale.US, "%.0f cm", m * 100)
+    }
+
+    /** Subject distance and depth of field from the focus result (diopters; 0 = infinity). */
+    private fun distanceText(diopters: Float?, range: android.util.Pair<Float, Float>?, focused: Boolean): String {
+        if (diopters == null) return "Distancia: —"
+        val subject = if (diopters <= 0.05f) "∞ (> 20 m)" else formatDistance(1f / diopters)
+        val approx = if (focusCalibrated) "" else " (aprox.)"
+        val sb = StringBuilder(if (focused) "Sujeto: $subject$approx" else "Enfocando… $subject")
+        if (range != null && focused) {
+            val nearM = if (range.first <= 0.05f) 20f else 1f / range.first
+            val farM = if (range.second <= 0.05f) 20f else 1f / range.second
+            sb.append("\nNítido: ").append(formatDistance(nearM)).append(" – ").append(formatDistance(farM))
+        }
+        return sb.toString()
     }
 
     // ---- Exposure ----
@@ -1123,11 +1283,27 @@ class MainActivity : Activity() {
                 if (transform != null) lastTransform = transform
                 if (firstTransform && wbMode == Wb.KELVIN) handler.post { refreshPreview() }
             }
+            val afState = result.get(CaptureResult.CONTROL_AF_STATE)
+            afFocused = manualFocus ||
+                afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED ||
+                afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
+
             if (frameCount++ % 10 != 0) return
             val shot = baseExposure()
             val text = "${modeLabel()} · Visor: ISO $iso · ${formatExposure(time)}\n" +
                 "Foto: ISO ${shot.iso} · ${formatExposure(shot.time)}"
-            runOnUiThread { info.text = text }
+            val distance = distanceText(
+                result.get(CaptureResult.LENS_FOCUS_DISTANCE),
+                result.get(CaptureResult.LENS_FOCUS_RANGE),
+                afFocused,
+            )
+            runOnUiThread {
+                info.text = text
+                if (distanceToggle.isChecked) {
+                    distanceBadge.text = distance
+                    distanceBadge.visibility = View.VISIBLE
+                }
+            }
         }
     }
 
@@ -1504,6 +1680,11 @@ class MainActivity : Activity() {
         private const val SHUTTER_LABEL = "Capturar"
         private const val REQUEST_LOCATION = 2
         private const val MAX_EXPOSURE_NS = 30_000_000_000L
+
+        // Initial smudge thresholds; tune with the on-screen debug readout.
+        private const val HAZE_LIMIT = 0.16f
+        private const val CONTRAST_LIMIT = 0.22f
+        private const val GLOW_LIMIT = 0.50f
         private const val ANALYSIS_W = 360
         private const val ANALYSIS_H = 480
         private const val ANALYSIS_INTERVAL_MS = 125L
