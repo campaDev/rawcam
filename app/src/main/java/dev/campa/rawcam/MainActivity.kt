@@ -108,12 +108,20 @@ class MainActivity : Activity() {
         val stack: Boolean = false,
         val infinity: Boolean = false,
         val scored: Boolean = false,
+        val warnMotion: Boolean = false,
         val saveJpeg: Boolean = withJpeg,
         val folder: String = DEFAULT_FOLDER,
         val tags: String? = null,
     )
 
-    private class ScoredShot(val base: String, val uris: MutableList<Uri>, val score: Float, val faces: Int, val eyesOpen: Int)
+    private class ScoredShot(
+        val base: String,
+        val uris: MutableList<Uri>,
+        val score: Float,
+        val faces: Int,
+        val eyesOpen: Int,
+        val blurPx: Float,
+    )
 
     /** Eyes/smile verdict for one burst frame (faces < 0 when not evaluated). */
     private class GroupScore(val factor: Float, val faces: Int, val eyesOpen: Int)
@@ -215,6 +223,14 @@ class MainActivity : Activity() {
     private var gyroFilled = 0
     private var gyroEma = 0f
     private var hasGyro = false
+    // Timestamped gyro history for per-frame motion (written on UI thread, read on camera thread).
+    private val gyroLock = Any()
+    private val gyroTs = LongArray(GYRO_HISTORY)
+    private val gyroMag = FloatArray(GYRO_HISTORY)
+    private var gyroHead = 0
+    private var gyroCount = 0
+    private var gyroTimebaseOk = false
+    private var stackRejected = 0
     @Volatile private var safeExposureNs = Long.MAX_VALUE
     @Volatile private var gyroRms = 1f
     private var focalPx = 0f
@@ -704,7 +720,8 @@ class MainActivity : Activity() {
         }
         val gyro = sensors.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
         hasGyro = gyro != null
-        gyro?.let { sensors.registerListener(gyroListener, it, SensorManager.SENSOR_DELAY_GAME) }
+        // ~200 Hz: enough samples to integrate rotation inside short exposures.
+        gyro?.let { sensors.registerListener(gyroListener, it, GYRO_PERIOD_US) }
         ui.post(grabTick)
         if (useLocation && hasLocationPermission()) startLocation()
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
@@ -938,6 +955,9 @@ class MainActivity : Activity() {
         }
         lastTransform = null
         nrModes = chars.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES)?.toSet() ?: emptySet()
+        // Gyro events use elapsedRealtimeNanos; frame timestamps only share that clock when REALTIME.
+        gyroTimebaseOk = chars.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) ==
+            CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME
         focusCalibrated = chars.get(CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION) !=
             CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION_UNCALIBRATED
         focalMm = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: 0f
@@ -1795,6 +1815,12 @@ class MainActivity : Activity() {
             val z = e.values[2]
             val magnitude = kotlin.math.sqrt(x * x + y * y + z * z)
             gyroEma += (magnitude - gyroEma) * 0.3f
+            synchronized(gyroLock) {
+                gyroTs[gyroHead] = e.timestamp
+                gyroMag[gyroHead] = magnitude
+                gyroHead = (gyroHead + 1) % GYRO_HISTORY
+                if (gyroCount < GYRO_HISTORY) gyroCount++
+            }
             gyroWindow[gyroPos] = magnitude
             gyroPos = (gyroPos + 1) % GYRO_WINDOW
             if (gyroFilled < GYRO_WINDOW) gyroFilled++
@@ -1808,6 +1834,34 @@ class MainActivity : Activity() {
         }
 
         override fun onAccuracyChanged(s: Sensor, accuracy: Int) {}
+    }
+
+    /**
+     * Motion blur (px) during one frame: mean angular speed over the frame's readout window
+     * (start + exposure + rolling-shutter skew) × exposure time × focal length in pixels.
+     * Returns -1 when it can't be measured (no gyro samples, or camera/gyro clocks differ).
+     */
+    private fun motionBlurPx(result: CaptureResult): Float {
+        if (!gyroTimebaseOk || focalPx <= 0f) return -1f
+        val start = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return -1f
+        val exposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: return -1f
+        val skew = result.get(CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW) ?: 0L
+        val from = start - GYRO_WINDOW_MARGIN_NS
+        val to = start + exposure + skew + GYRO_WINDOW_MARGIN_NS
+        var sum = 0.0
+        var n = 0
+        synchronized(gyroLock) {
+            for (i in 0 until gyroCount) {
+                val t = gyroTs[i]
+                if (t in from..to) {
+                    sum += gyroMag[i]
+                    n++
+                }
+            }
+        }
+        if (n == 0) return -1f
+        val angle = sum / n * (exposure / 1e9)
+        return (angle * focalPx * zoomRatio).toFloat()
     }
 
     private fun handHoldText(photoNs: Long): String {
@@ -2646,7 +2700,14 @@ class MainActivity : Activity() {
                 val scored = drive.kind == DriveKind.BURST && !jpegOnly
                 // With people in frame, bursts also capture a JPEG so blinks can be scored.
                 val jpegTarget = withJpeg || (scored && groupFaces)
-                stillRequest(e, Frame(base, !jpegOnly, jpegTarget, location, isStack, drive.infinity, scored, withJpeg, folder, tags))
+                stillRequest(
+                    e,
+                    Frame(
+                        base, !jpegOnly, jpegTarget, location, isStack, drive.infinity, scored,
+                        warnMotion = drive.kind == DriveKind.SINGLE,
+                        saveJpeg = withJpeg, folder = folder, tags = tags,
+                    ),
+                )
             }
         } catch (e: Exception) {
             toast("Captura: ${e.message}")
@@ -2734,11 +2795,26 @@ class MainActivity : Activity() {
         pendingResults.remove(ts)
         pendingImages.remove(ts)
         pendingJpegs.remove(ts)
+        val blur = motionBlurPx(result)
         io.execute {
             var ok = true
             val jpegBytes = jpeg?.let { readJpeg(it) }
             val group = if (frame.scored && jpegBytes != null) groupScore(jpegBytes) else null
-            if (raw != null) ok = if (frame.stack) accumulate(raw, result, frame) else saveDng(raw, result, frame, group)
+            if (raw != null) {
+                ok = when {
+                    // A moved frame would smear the average: leave it out (not a failure).
+                    frame.stack && blur > STACK_BLUR_MAX_PX -> {
+                        raw.close()
+                        stackRejected++
+                        true
+                    }
+                    frame.stack -> accumulate(raw, result, frame)
+                    else -> saveDng(raw, result, frame, group, blur)
+                }
+            }
+            if (frame.warnMotion && blur > SINGLE_BLUR_WARN_PX) {
+                toast(String.format(Locale.US, "⚠ La foto salió movida (≈%.0f px): apoyá el celu o usá Ráfaga", blur))
+            }
             if (jpegBytes != null && frame.saveJpeg) {
                 val uri = saveJpegBytes(jpegBytes, "IMG_${frame.base}.jpg", frame.folder)
                 if (uri == null) {
@@ -2832,7 +2908,10 @@ class MainActivity : Activity() {
         val worst = scoredShots.minBy { it.score }
         val worstPct = (worst.score / best.score * 100).roundToInt()
         val label = best.base.substringAfterLast('_')
-        val eyes = if (best.faces > 0) " · ojos abiertos ${best.eyesOpen}/${best.faces}" else ""
+        val eyes = (if (best.faces > 0) " · ojos abiertos ${best.eyesOpen}/${best.faces}" else "") +
+            (if (best.blurPx >= 0f) String.format(Locale.US, " · movimiento ≈%.1f px", best.blurPx) else "")
+        val moved = scoredShots.count { it.blurPx > SINGLE_BLUR_WARN_PX }
+        val movedText = if (moved > 0) " · $moved movidas" else ""
         if (keepOnlyBest) {
             var removed = 0
             for (shot in scoredShots) {
@@ -2845,9 +2924,9 @@ class MainActivity : Activity() {
                     }
                 }
             }
-            toast("Guardada solo la mejor ($label$eyes). Archivos descartados: $removed")
+            toast("Guardada solo la mejor ($label$eyes). Archivos descartados: $removed$movedText")
         } else {
-            toast("Mejor toma: $label$eyes · la peor tiene $worstPct% de su puntaje")
+            toast("Mejor toma: $label$eyes · la peor tiene $worstPct% de su puntaje$movedText")
         }
         scoredShots.clear()
     }
@@ -2907,6 +2986,7 @@ class MainActivity : Activity() {
     private fun resetStack() {
         stackSum = null
         stackCount = 0
+        stackRejected = 0
         stackResult = null
         stackLocation = null
     }
@@ -2951,8 +3031,13 @@ class MainActivity : Activity() {
         val sum = stackSum
         val result = stackResult
         val n = stackCount
+        val rejected = stackRejected
         if (sum == null || result == null || n == 0) {
-            toast("No hay cuadros para promediar")
+            toast(
+                if (rejected > 0) "Los $rejected cuadros salieron movidos: apoyá el celu o acortá la exposición"
+                else "No hay cuadros para promediar"
+            )
+            resetStack()
             return
         }
         try {
@@ -2972,7 +3057,7 @@ class MainActivity : Activity() {
                 }
             }
             publish(uri)
-            toast("Guardado $name")
+            toast(if (rejected > 0) "Guardado $name ($rejected descartados por movimiento)" else "Guardado $name")
         } catch (e: Exception) {
             toast("Stack DNG: ${e.message}")
         } finally {
@@ -2982,11 +3067,20 @@ class MainActivity : Activity() {
 
     // ---- Saving (io thread) ----
 
-    private fun saveDng(image: Image, result: TotalCaptureResult, frame: Frame, group: GroupScore? = null): Boolean {
+    private fun saveDng(
+        image: Image,
+        result: TotalCaptureResult,
+        frame: Frame,
+        group: GroupScore? = null,
+        blurPx: Float = -1f,
+    ): Boolean {
         return try {
-            // Sharpness always counts; blinks and frowns pull a frame down when faces were evaluated.
+            // Sharpness always counts; blinks and frowns pull a frame down when faces were evaluated,
+            // and measured camera motion penalises it smoothly (≈2 px of blur halves the score).
             val sharp = if (frame.scored) rawSharpness(image) else 0f
-            val score = if (group != null) sharp * (0.3f + 0.7f * group.factor) else sharp
+            val faces = if (group != null) sharp * (0.3f + 0.7f * group.factor) else sharp
+            val motion = if (blurPx > 0f) 1f / (1f + (blurPx / BLUR_HALF_SCORE_PX).pow(2)) else 1f
+            val score = faces * motion
             val uri = insertImage("RAW_${frame.base}.dng", "image/x-adobe-dng", frame.folder)
             contentResolver.openOutputStream(uri)!!.use { out ->
                 val (dngChars, dngResult) = dngSource(result)
@@ -2999,7 +3093,7 @@ class MainActivity : Activity() {
             publish(uri)
             if (frame.scored) {
                 scoredShots.add(
-                    ScoredShot(frame.base, mutableListOf(uri), score, group?.faces ?: -1, group?.eyesOpen ?: 0)
+                    ScoredShot(frame.base, mutableListOf(uri), score, group?.faces ?: -1, group?.eyesOpen ?: 0, blurPx)
                 )
             }
             true
@@ -3150,6 +3244,13 @@ class MainActivity : Activity() {
         private const val STAR_CONTRAST = 25
         private const val FACE_MIN_SCORE = 50
         private const val FACE_REFRESH_MS = 500L
+
+        private const val GYRO_PERIOD_US = 5000
+        private const val GYRO_HISTORY = 1024
+        private const val GYRO_WINDOW_MARGIN_NS = 5_000_000L
+        private const val STACK_BLUR_MAX_PX = 2.5f
+        private const val SINGLE_BLUR_WARN_PX = 3f
+        private const val BLUR_HALF_SCORE_PX = 2f
 
         private const val GYRO_WINDOW = 50
         private const val GYRO_NOISE_FLOOR = 0.002f

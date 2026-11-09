@@ -31,6 +31,8 @@ El APK se compila en GitHub Actions (`build-apk`) en cada push. Se descarga desd
 ### Modos de disparo
 - ✅ Simple, **Ráfaga** ×4/×8/×16, **Bracketing** ±1 ×3, ±2 ×3, ±2 ×5.
 - ✅ **Promedio** ×8/×16/×32 dentro de la app (un solo DNG, sin alinear; requiere trípode).
+- ✅ **Descarte de cuadros movidos** (giroscopio por cuadro): Promedio y Astro excluyen los movidos,
+  la Ráfaga los penaliza y la foto simple avisa si salió movida.
 - ✅ **Astro** ×16/×32 con foco en ∞, más asistente (regla NPF, deriva del cielo, conteo de
   estrellas, ajustes con un toque).
 - ✅ **Mejor cuadro de la ráfaga** por nitidez, con opción "solo la mejor"; en fotos de grupo
@@ -66,9 +68,14 @@ El APK se compila en GitHub Actions (`build-apk`) en cada push. Se descarga desd
 - ✅ Ubicación GPS opcional en JPEG y DNG.
 - ✅ Selector de lente (1× / gran angular por zoom).
 
+## Hoja de ruta
+Plan por fases para superar a la Google Camera escena por escena, midiendo cada paso:
+[docs/hoja-de-ruta.md](docs/hoja-de-ruta.md).
+
 ## Pendiente (documentado)
 - [Apilado con alineación](docs/apilado-alineado.md): ráfagas a pulso y astro sin trazos, al
   estilo HDR+.
+- [Poca luz y zoom](docs/poca-luz-y-zoom.md): modo Noche automático, visor nocturno, pellizcar para zoom y chips 0.7×/1×/2×/5×.
 - [Fotos de productos](docs/fotos-productos.md): exportación para redes, fondo blanco automático,
   360°, apilado de foco.
 - [Fotos de familia](docs/fotos-familia.md): retrato con fondo desenfocado.
