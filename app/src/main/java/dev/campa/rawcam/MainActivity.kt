@@ -409,6 +409,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+        setupFullscreen()
 
         previewFrame = findViewById(R.id.previewFrame)
         preview = findViewById(R.id.preview)
@@ -647,6 +648,7 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        hideSystemBars()
         sensors.getDefaultSensor(Sensor.TYPE_GRAVITY)?.let {
             sensors.registerListener(levelListener, it, SensorManager.SENSOR_DELAY_UI)
         }
@@ -740,6 +742,57 @@ class MainActivity : Activity() {
             return true
         }
         return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        // Bars come back after dialogs, permission prompts and the Google scanner screens.
+        if (hasFocus) hideSystemBars()
+    }
+
+    /**
+     * Immersive camera UI. Android 15 (targetSdk 35) draws apps edge-to-edge, so without this the
+     * status bar overlaps the viewfinder. Bars are hidden (a swipe shows them briefly) and the
+     * content is padded only by the display cutout, so nothing sits under the front camera.
+     */
+    private fun setupFullscreen() {
+        window.attributes = window.attributes.apply {
+            layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+        val root = findViewById<View>(android.R.id.content)
+        root.setOnApplyWindowInsetsListener { v, insets ->
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val cut = insets.getInsets(android.view.WindowInsets.Type.displayCutout())
+                // Keyboard (e.g. typing a SKU) shrinks the controls instead of covering them.
+                val ime = insets.getInsets(android.view.WindowInsets.Type.ime())
+                v.setPadding(cut.left, cut.top, cut.right, ime.bottom)
+            } else {
+                val cut = insets.displayCutout
+                v.setPadding(cut?.safeInsetLeft ?: 0, cut?.safeInsetTop ?: 0, cut?.safeInsetRight ?: 0, 0)
+            }
+            insets
+        }
+        hideSystemBars()
+    }
+
+    private fun hideSystemBars() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.setDecorFitsSystemWindows(false)
+            window.insetsController?.let {
+                it.hide(android.view.WindowInsets.Type.systemBars())
+                it.systemBarsBehavior = android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = (
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                    View.SYSTEM_UI_FLAG_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                    View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
+                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                )
+        }
     }
 
     private fun startWhenReady() {
