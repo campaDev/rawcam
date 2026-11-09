@@ -39,4 +39,7 @@ dependencies {
     // On-device ML Kit (bundled models, no network): eyes/smile per face, and body pose for the hand gesture.
     implementation("com.google.mlkit:face-detection:16.1.7")
     implementation("com.google.mlkit:pose-detection:18.0.0-beta5")
+    // Google-provided scanner UIs (via Play services): barcode → SKU, and document → PDF.
+    implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
+    implementation("com.google.android.gms:play-services-mlkit-document-scanner:16.0.0-beta1")
 }

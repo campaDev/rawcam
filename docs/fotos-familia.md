@@ -4,9 +4,9 @@ Funciones para capturar el momento: nadie con los ojos cerrados, niños que no s
 el fotógrafo también dentro de la foto.
 
 Estado:
-- ✅ Implementado: **1** timer de grupo, **2** modo niños, **4** mejor toma de grupo,
-  **6** disparo con gesto (mano por encima de la cabeza, con ML Kit Pose Detection).
-- ⏳ Pendiente: **3** disparo con sonrisa, **5** retrato con fondo desenfocado.
+- ✅ Implementado: **1** timer de grupo, **2** modo niños, **3** disparo con sonrisa,
+  **4** mejor toma de grupo, **6** disparo con gesto (mano por encima de la cabeza).
+- ⏳ Pendiente: **5** retrato con fondo desenfocado.
 - Dependencias ya agregadas: `com.google.mlkit:face-detection`, `com.google.mlkit:pose-detection`.
 
 ## Prioridades
@@ -15,7 +15,7 @@ Estado:
 |---|---|---|---|---|
 | 1 | Timer de grupo | Baja | 1 | ✅ Hecho |
 | 2 | Modo niños | Baja | 1 | ✅ Hecho |
-| 3 | Disparo con sonrisa | Media | 1 | ⏳ Pendiente |
+| 3 | Disparo con sonrisa | Media | 1 | ✅ Hecho |
 | 4 | Mejor toma de grupo | Media | 2 | ✅ Hecho |
 | 5 | Retrato con fondo desenfocado | Media | 2 | ⏳ Pendiente |
 | 6 | Disparo con gesto | Media | 3 | ✅ Hecho |
@@ -48,15 +48,15 @@ Las tres primeras reutilizan la detección de caras que ya existe (`handleFaces`
 - Pendiente: subir el umbral a 1/500 s si se detecta movimiento rápido. Esto puede venir del
   análisis de la vista previa (diferencia entre cuadros) o de que las caras se desplacen rápido.
 
-## 3. Disparo con sonrisa ⏳
+## 3. Disparo con sonrisa ✅
 **Cómo:**
 - **ML Kit Face Detection** con clasificación activada: da por cara `smilingProbability`,
   `leftEyeOpenProbability` y `rightEyeOpenProbability`.
 - Se analiza sobre la vista previa reducida que ya se usa en `analyze` (no hace falta otro stream).
 - Condición de disparo: todas las caras con sonrisa > 0.7 y ojos abiertos > 0.6, estable durante
   unos 300 ms.
-- Indicador sobre cada cara (😊 / 😐 / ojos cerrados) para que el fotógrafo vea quién falta.
-- Dependencia nueva: `com.google.mlkit:face-detection`.
+- El botón muestra cuántas caras están listas (`😊 2/3`); a los 20 s sin lograrlo, cancela.
+- Pendiente: indicador sobre cada cara (😊 / 😐 / ojos cerrados) en el visor.
 
 ## 4. Mejor toma de grupo ✅
 - Extiende el "mejor cuadro de la ráfaga" (`rawSharpness` + `reportBest`).

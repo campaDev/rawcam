@@ -5,8 +5,9 @@ archivos listos para publicar. Canales de publicación: **WhatsApp, Instagram, F
 (MercadoLibre no se usa).
 
 Estado:
-- ✅ Implementado: **1** tarjeta gris, **2** sesión de producto, **3** guías de encuadre.
-- ⏳ Pendiente: 4–8.
+- ✅ Implementado: **1** tarjeta gris, **2** sesión de producto, **3** guías de encuadre,
+  **4** SKU (con lectura de código de barras, ver `ml-kit.md`).
+- ⏳ Pendiente: 5–8.
 
 ## Prioridades
 
@@ -15,7 +16,7 @@ Estado:
 | 1 | Balance de blancos con tarjeta gris | Baja | 1 | ✅ Hecho |
 | 2 | Modo sesión de producto (bloqueos) | Baja | 1 | ✅ Hecho |
 | 3 | Guías de encuadre 1:1, 4:5 y 9:16 | Baja | 1 | ✅ Hecho |
-| 4 | Nombres y carpetas por SKU | Baja | 1 | ⏳ Pendiente |
+| 4 | Nombres y carpetas por SKU | Baja | 1 | ✅ Hecho |
 | 5 | Exportación lista para la web | Media | 2 | ⏳ Pendiente |
 | 6 | Fondo blanco automático | Media | 2 | ⏳ Pendiente |
 | 7 | Producto 360° | Baja | 2 | ⏳ Pendiente |
@@ -68,11 +69,15 @@ En 9:16 se marcan además las **zonas seguras**, donde esas apps tapan la imagen
 interfaz: ~14% arriba, ~22% abajo (descripción, botones) y ~15% a la derecha (likes,
 comentarios). El producto y el texto importante tienen que quedar dentro.
 
-## 4. Nombres y carpetas por SKU ⏳
-- Campo de texto "SKU" antes de la sesión (p. ej. `TNT-0123`).
-- Carpeta: `DCIM/RawCam/<SKU>/` (cambiar `RELATIVE_PATH` en `insertImage`).
-- Nombres: `<SKU>_01.dng`, `<SKU>_01.jpg`, `<SKU>_02…`, con contador por SKU.
-- Recordar el último SKU y sugerir el siguiente número.
+## 4. Nombres y carpetas por SKU ✅
+- Campo "SKU" en la app, a mano o con el botón **Código** (lee EAN/UPC/QR con Google Code Scanner).
+- Se normaliza: mayúsculas, solo `A–Z 0–9 - _`, hasta 40 caracteres.
+- Carpeta: `DCIM/RawCam/<SKU>/`.
+- Nombres: `RAW_<SKU>_01.dng`, `IMG_<SKU>_01.jpg`, `RAW_<SKU>_02…`. El contador por SKU se
+  guarda entre sesiones, así que retomar un producto otro día sigue la numeración.
+- Ráfagas y brackets agregan su sufijo (`RAW_<SKU>_03_b01.dng`, `RAW_<SKU>_04_ev-2.0.dng`).
+- Los PDF del escáner de documentos llevan el SKU como prefijo (`<SKU>_Doc_<fecha>.pdf`).
+- Para volver a nombres por fecha, alcanza con dejar el campo vacío.
 
 ## 5. Exportación lista para la web ⏳
 Junto al RAW, generar un JPEG adicional:

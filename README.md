@@ -38,6 +38,7 @@ El APK se compila en GitHub Actions (`build-apk`) en cada push. Se descarga desd
 - ✅ Timer 2 s / 10 s / **grupo**; disparo con botones de volumen; **disparo con gesto** (mano
   arriba); **esperar quietud** (giroscopio).
 - ✅ **Intervalómetro** (2–60 s, 10–300 tomas) para timelapse.
+- ✅ **Disparo con sonrisa**: espera a que todos sonrían con los ojos abiertos (ML Kit).
 
 ### Ayudas en el visor
 - ✅ Histograma en vivo, zebras, focus peaking, grilla de tercios y nivel.
@@ -51,6 +52,9 @@ El APK se compila en GitHub Actions (`build-apk`) en cada push. Se descarga desd
 - ✅ **Modo niños**: 1/250 s, caras y ráfaga ×4 con la mejor.
 
 ### Guardado
+- ✅ **SKU** (a mano o leyendo el código de barras): carpeta `DCIM/RawCam/<SKU>/` y numeración por
+  producto.
+- ✅ **Escáner de documentos** a PDF en `Documents/RawCam/` (ML Kit Document Scanner).
 - ✅ Formato RAW + JPEG / Solo RAW / Solo JPEG; calidad JPEG 85–100%; JPEG "natural" (sin
   nitidez, ruido mínimo).
 - ✅ Ubicación GPS opcional en JPEG y DNG.
@@ -59,9 +63,11 @@ El APK se compila en GitHub Actions (`build-apk`) en cada push. Se descarga desd
 ## Pendiente (documentado)
 - [Apilado con alineación](docs/apilado-alineado.md): ráfagas a pulso y astro sin trazos, al
   estilo HDR+.
-- [Fotos de productos](docs/fotos-productos.md): SKU, exportación para redes, fondo blanco
-  automático, 360°, apilado de foco.
-- [Fotos de familia](docs/fotos-familia.md): disparo con sonrisa, retrato con fondo desenfocado.
+- [Fotos de productos](docs/fotos-productos.md): exportación para redes, fondo blanco automático,
+  360°, apilado de foco.
+- [Fotos de familia](docs/fotos-familia.md): retrato con fondo desenfocado.
+- [Mejoras con ML Kit](docs/ml-kit.md): leer etiquetas, producto centrado, mascotas, escenas por
+  contenido, etiquetas automáticas.
 - Calibrar los umbrales del detector de lente sucio con datos reales.
 - Recordar los ajustes al cerrar la app.
 

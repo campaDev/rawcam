@@ -4,7 +4,13 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ContentValues
+import android.content.Intent
+import android.content.IntentSender
 import android.content.pm.PackageManager
+import android.os.Environment
+import android.text.Editable
+import android.text.TextWatcher
+import android.widget.EditText
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
@@ -58,7 +64,11 @@ import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import com.google.android.gms.tasks.Tasks
+import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions
+import com.google.mlkit.vision.documentscanner.GmsDocumentScanning
+import com.google.mlkit.vision.documentscanner.GmsDocumentScanningResult
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
 import com.google.mlkit.vision.pose.Pose
@@ -95,6 +105,7 @@ class MainActivity : Activity() {
         val infinity: Boolean = false,
         val scored: Boolean = false,
         val saveJpeg: Boolean = withJpeg,
+        val folder: String = DEFAULT_FOLDER,
     )
 
     private class ScoredShot(val base: String, val uris: MutableList<Uri>, val score: Float, val faces: Int, val eyesOpen: Int)
@@ -212,6 +223,31 @@ class MainActivity : Activity() {
     // Camera handler thread only.
     private var burstSequence = false
     @Volatile private var bestOnly = false
+
+    private lateinit var skuField: EditText
+    private lateinit var barcodeBtn: Button
+    private lateinit var docBtn: Button
+    private lateinit var smileToggle: CheckBox
+    @Volatile private var currentSku: String? = null
+    private val prefs by lazy { getSharedPreferences("rawcam", MODE_PRIVATE) }
+
+    // Smile shutter (UI thread): waits until every face smiles with eyes open.
+    private val previewFaceDetector by lazy {
+        FaceDetection.getClient(
+            FaceDetectorOptions.Builder()
+                .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+                .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
+                .setMinFaceSize(0.1f)
+                .build()
+        )
+    }
+    private var waitingSmile = false
+    private var smileBusy = false
+    private var smileSince = 0L
+    private var smileDeadline = 0L
+
+    // Camera handler thread: folder of the running sequence (for the averaged stack DNG).
+    private var stackFolder = DEFAULT_FOLDER
 
     private lateinit var kidsToggle: CheckBox
     private lateinit var gestureToggle: CheckBox
@@ -409,6 +445,24 @@ class MainActivity : Activity() {
         locationToggle = findViewById(R.id.locationToggle)
         intervalBtn = findViewById(R.id.intervalBtn)
         shotsBtn = findViewById(R.id.shotsBtn)
+        skuField = findViewById(R.id.skuField)
+        barcodeBtn = findViewById(R.id.barcodeBtn)
+        docBtn = findViewById(R.id.docBtn)
+        smileToggle = findViewById(R.id.smileToggle)
+        skuField.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                currentSku = normalizeSku(s?.toString().orEmpty())
+            }
+        })
+        barcodeBtn.setOnClickListener { scanBarcode() }
+        docBtn.setOnClickListener { scanDocument() }
+        smileToggle.setOnCheckedChangeListener { _, checked ->
+            if (checked) toast("Al disparar, la foto sale cuando todos sonríen con los ojos abiertos")
+            else cancelSmile()
+        }
+
         kidsToggle = findViewById(R.id.kidsToggle)
         gestureToggle = findViewById(R.id.gestureToggle)
         kidsToggle.setOnCheckedChangeListener { _, checked -> if (checked) startKidsMode() else endKidsMode() }
@@ -661,6 +715,7 @@ class MainActivity : Activity() {
         stopInterval()
         cancelSteady()
         cancelGroupTimer()
+        cancelSmile()
         stopLocation()
         sensors.unregisterListener(levelListener)
         sensors.unregisterListener(gyroListener)
@@ -1054,6 +1109,10 @@ class MainActivity : Activity() {
             cancelGroupTimer()
             return
         }
+        if (waitingSmile) {
+            cancelSmile()
+            return
+        }
         if (counting) {
             cancelCountdown()
             return
@@ -1127,6 +1186,147 @@ class MainActivity : Activity() {
         waitingGroup = false
         ui.removeCallbacks(groupTick)
         updateShutterIdle()
+    }
+
+    // ---- Smile shutter ----
+
+    private fun startSmileWait() {
+        waitingSmile = true
+        smileSince = 0L
+        smileDeadline = android.os.SystemClock.uptimeMillis() + SMILE_MAX_WAIT_MS
+        shutter.text = "Esperando sonrisas… · tocá para cancelar"
+        ui.post(smileTick)
+    }
+
+    private val smileTick = object : Runnable {
+        override fun run() {
+            if (!waitingSmile) return
+            if (android.os.SystemClock.uptimeMillis() >= smileDeadline) {
+                cancelSmile()
+                toast("No se lograron todas las sonrisas en 20 s")
+                return
+            }
+            if (!smileBusy && preview.isAvailable) {
+                val bmp = preview.getBitmap(ANALYSIS_W, ANALYSIS_H)
+                if (bmp != null) {
+                    smileBusy = true
+                    previewFaceDetector.process(InputImage.fromBitmap(bmp, 0))
+                        .addOnSuccessListener { onSmileFaces(it) }
+                        .addOnCompleteListener {
+                            smileBusy = false
+                            bmp.recycle()
+                        }
+                }
+            }
+            ui.postDelayed(this, SMILE_INTERVAL_MS)
+        }
+    }
+
+    private fun onSmileFaces(faces: List<com.google.mlkit.vision.face.Face>) {
+        if (!waitingSmile) return
+        val ready = faces.count {
+            (it.smilingProbability ?: 0f) > SMILE_MIN &&
+                min(it.leftEyeOpenProbability ?: 0f, it.rightEyeOpenProbability ?: 0f) > SMILE_EYES_MIN
+        }
+        shutter.text = if (faces.isEmpty()) "Esperando caras… · tocá para cancelar"
+        else "😊 $ready/${faces.size} · tocá para cancelar"
+        val now = android.os.SystemClock.uptimeMillis()
+        if (faces.isNotEmpty() && ready == faces.size) {
+            if (smileSince == 0L) smileSince = now
+            if (now - smileSince >= SMILE_HOLD_MS) {
+                waitingSmile = false
+                ui.removeCallbacks(smileTick)
+                handler.post { startSequence() }
+            }
+        } else {
+            smileSince = 0L
+        }
+    }
+
+    private fun cancelSmile() {
+        if (!waitingSmile) return
+        waitingSmile = false
+        ui.removeCallbacks(smileTick)
+        updateShutterIdle()
+    }
+
+    // ---- SKU, barcode and document scanner ----
+
+    /** Uppercase, only A–Z 0–9 - _, max 40 chars; null when empty. */
+    private fun normalizeSku(raw: String): String? =
+        raw.uppercase(Locale.US).filter { it in 'A'..'Z' || it in '0'..'9' || it == '-' || it == '_' }
+            .take(40).ifEmpty { null }
+
+    private fun nextSkuNumber(sku: String): Int {
+        val n = prefs.getInt("sku_$sku", 0) + 1
+        prefs.edit().putInt("sku_$sku", n).apply()
+        return n
+    }
+
+    /** Google Code Scanner UI (Play services): no extra permission; the value becomes the SKU. */
+    private fun scanBarcode() {
+        GmsBarcodeScanning.getClient(this).startScan()
+            .addOnSuccessListener { barcode ->
+                val value = barcode.rawValue ?: return@addOnSuccessListener
+                val sku = normalizeSku(value)
+                if (sku == null) {
+                    toast("El código no tiene caracteres válidos para un SKU: $value")
+                    return@addOnSuccessListener
+                }
+                skuField.setText(sku)
+                toast("SKU: $sku · las fotos van a DCIM/RawCam/$sku")
+            }
+            .addOnFailureListener { toast("No se pudo escanear: ${it.message}") }
+    }
+
+    private fun scanDocument() {
+        val options = GmsDocumentScannerOptions.Builder()
+            .setGalleryImportAllowed(true)
+            .setPageLimit(DOC_PAGE_LIMIT)
+            .setResultFormats(GmsDocumentScannerOptions.RESULT_FORMAT_PDF)
+            .setScannerMode(GmsDocumentScannerOptions.SCANNER_MODE_FULL)
+            .build()
+        GmsDocumentScanning.getClient(options).getStartScanIntent(this)
+            .addOnSuccessListener { sender ->
+                try {
+                    startIntentSenderForResult(sender, REQUEST_DOCUMENT, null, 0, 0, 0)
+                } catch (e: IntentSender.SendIntentException) {
+                    toast("No se pudo abrir el escáner: ${e.message}")
+                }
+            }
+            .addOnFailureListener { toast("Escáner no disponible: ${it.message}") }
+    }
+
+    @Deprecated("Activity result API kept for the plain Activity base class")
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQUEST_DOCUMENT || resultCode != RESULT_OK) return
+        val intent = data ?: return
+        val pdf = GmsDocumentScanningResult.fromActivityResultIntent(intent)?.pdf ?: return
+        val sku = currentSku
+        io.execute { savePdf(pdf.uri, pdf.pageCount, sku) }
+    }
+
+    private fun savePdf(source: Uri, pages: Int, sku: String?) {
+        try {
+            val date = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            val name = (sku?.let { "${it}_" } ?: "") + "Doc_$date.pdf"
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                put(MediaStore.MediaColumns.MIME_TYPE, "application/pdf")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOCUMENTS + "/RawCam")
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+            val target = contentResolver.insert(MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values)!!
+            contentResolver.openInputStream(source)!!.use { input ->
+                contentResolver.openOutputStream(target)!!.use { input.copyTo(it) }
+            }
+            contentResolver.update(target, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+            toast("PDF guardado en Documents/RawCam/$name ($pages pág.)")
+        } catch (e: Exception) {
+            toast("PDF: ${e.message}")
+        }
     }
 
     // ---- Kids mode ----
@@ -1321,6 +1521,10 @@ class MainActivity : Activity() {
 
     /** Starts the capture, optionally waiting (up to a limit) until the phone is held still. */
     private fun fire() {
+        if (smileToggle.isChecked) {
+            startSmileWait()
+            return
+        }
         if (!steadyToggle.isChecked || !hasGyro) {
             handler.post { startSequence() }
             return
@@ -2076,11 +2280,14 @@ class MainActivity : Activity() {
         if (busy || session == null || device == null) return
         val drive = drives[driveIndex]
         val baseExp = baseExposure()
-        stamp = if (intervalShot > 0) {
-            String.format(Locale.US, "%s_t%04d", intervalStamp, intervalShot)
-        } else {
-            SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        // With a SKU, every capture is numbered per product and stored in its own folder.
+        val sku = currentSku
+        stamp = when {
+            sku != null -> String.format(Locale.US, "%s_%02d", sku, nextSkuNumber(sku))
+            intervalShot > 0 -> String.format(Locale.US, "%s_t%04d", intervalStamp, intervalShot)
+            else -> SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         }
+        val folder = if (sku != null) "$DEFAULT_FOLDER/$sku" else DEFAULT_FOLDER
 
         // Stacks are always RAW; bursts and brackets stay RAW-only unless the user chose JPEG only.
         val isStack = drive.kind == DriveKind.STACK
@@ -2101,7 +2308,7 @@ class MainActivity : Activity() {
                 val scored = drive.kind == DriveKind.BURST && !jpegOnly
                 // With people in frame, bursts also capture a JPEG so blinks can be scored.
                 val jpegTarget = withJpeg || (scored && groupFaces)
-                stillRequest(e, Frame(base, !jpegOnly, jpegTarget, location, isStack, drive.infinity, scored, withJpeg))
+                stillRequest(e, Frame(base, !jpegOnly, jpegTarget, location, isStack, drive.infinity, scored, withJpeg, folder))
             }
         } catch (e: Exception) {
             toast("Captura: ${e.message}")
@@ -2116,6 +2323,7 @@ class MainActivity : Activity() {
         inFlight = 0
         stackSequence = isStack
         stackBase = stamp
+        stackFolder = folder
         burstSequence = drive.kind == DriveKind.BURST && !jpegOnly
         if (isStack) io.execute { resetStack() }
         if (burstSequence) io.execute { scoredShots.clear() }
@@ -2194,7 +2402,7 @@ class MainActivity : Activity() {
             val group = if (frame.scored && jpegBytes != null) groupScore(jpegBytes) else null
             if (raw != null) ok = if (frame.stack) accumulate(raw, result, frame) else saveDng(raw, result, frame, group)
             if (jpegBytes != null && frame.saveJpeg) {
-                val uri = saveJpegBytes(jpegBytes, "IMG_${frame.base}.jpg")
+                val uri = saveJpegBytes(jpegBytes, "IMG_${frame.base}.jpg", frame.folder)
                 if (uri == null) ok = false
                 else if (frame.scored) scoredShots.lastOrNull { it.base == frame.base }?.uris?.add(uri)
             }
@@ -2228,7 +2436,8 @@ class MainActivity : Activity() {
             stackSequence -> {
                 toast("Promediando $saved cuadros…")
                 val base = stackBase
-                io.execute { writeStack(base) }
+                val folder = stackFolder
+                io.execute { writeStack(base, folder) }
             }
             burstSequence -> {
                 val keepOnlyBest = bestOnly
@@ -2396,7 +2605,7 @@ class MainActivity : Activity() {
     }
 
     /** Writes the averaged frame as a DNG using the first frame's metadata. */
-    private fun writeStack(base: String) {
+    private fun writeStack(base: String, folder: String) {
         val sum = stackSum
         val result = stackResult
         val n = stackCount
@@ -2411,7 +2620,7 @@ class MainActivity : Activity() {
             pixels.rewind()
 
             val name = "RAW_${base}_avg$n.dng"
-            val uri = insertImage(name, "image/x-adobe-dng")
+            val uri = insertImage(name, "image/x-adobe-dng", folder)
             contentResolver.openOutputStream(uri)!!.use { out ->
                 val (dngChars, dngResult) = dngSource(result)
                 DngCreator(dngChars, dngResult).use { dng ->
@@ -2436,7 +2645,7 @@ class MainActivity : Activity() {
             // Sharpness always counts; blinks and frowns pull a frame down when faces were evaluated.
             val sharp = if (frame.scored) rawSharpness(image) else 0f
             val score = if (group != null) sharp * (0.3f + 0.7f * group.factor) else sharp
-            val uri = insertImage("RAW_${frame.base}.dng", "image/x-adobe-dng")
+            val uri = insertImage("RAW_${frame.base}.dng", "image/x-adobe-dng", frame.folder)
             contentResolver.openOutputStream(uri)!!.use { out ->
                 val (dngChars, dngResult) = dngSource(result)
                 DngCreator(dngChars, dngResult).use { dng ->
@@ -2491,9 +2700,9 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun saveJpegBytes(bytes: ByteArray, name: String): Uri? {
+    private fun saveJpegBytes(bytes: ByteArray, name: String, folder: String): Uri? {
         return try {
-            val uri = insertImage(name, "image/jpeg")
+            val uri = insertImage(name, "image/jpeg", folder)
             contentResolver.openOutputStream(uri)!!.use { it.write(bytes) }
             publish(uri)
             uri
@@ -2503,11 +2712,11 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun insertImage(name: String, mime: String): Uri {
+    private fun insertImage(name: String, mime: String, folder: String = DEFAULT_FOLDER): Uri {
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, name)
             put(MediaStore.Images.Media.MIME_TYPE, mime)
-            put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/RawCam")
+            put(MediaStore.Images.Media.RELATIVE_PATH, folder)
             put(MediaStore.Images.Media.IS_PENDING, 1)
         }
         return contentResolver.insert(MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values)!!
@@ -2543,6 +2752,15 @@ class MainActivity : Activity() {
         private const val HAZE_LIMIT = 0.16f
         private const val CONTRAST_LIMIT = 0.22f
         private const val GLOW_LIMIT = 0.50f
+
+        private const val DEFAULT_FOLDER = "DCIM/RawCam"
+        private const val REQUEST_DOCUMENT = 3
+        private const val DOC_PAGE_LIMIT = 20
+        private const val SMILE_MAX_WAIT_MS = 20_000L
+        private const val SMILE_INTERVAL_MS = 250L
+        private const val SMILE_HOLD_MS = 300L
+        private const val SMILE_MIN = 0.7f
+        private const val SMILE_EYES_MIN = 0.6f
 
         private const val GROUP_TIMER = -1
         private const val GROUP_HOLD_MS = 1000L
