@@ -6,15 +6,18 @@ import android.app.Activity
 import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.ImageFormat
+import android.graphics.Rect
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.DngCreator
 import android.hardware.camera2.TotalCaptureResult
+import android.hardware.camera2.params.MeteringRectangle
 import android.media.ExifInterface
 import android.media.Image
 import android.media.ImageReader
@@ -22,58 +25,119 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import android.provider.MediaStore
 import android.util.Range
+import android.util.Rational
 import android.util.Size
+import android.view.GestureDetector
+import android.view.HapticFeedbackConstants
+import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.Surface
 import android.view.TextureView
+import android.view.View
 import android.widget.Button
+import android.widget.FrameLayout
+import android.widget.RadioGroup
 import android.widget.SeekBar
-import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Executors
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.min
+import kotlin.math.pow
 import kotlin.math.roundToInt
 
 class MainActivity : Activity() {
 
+    private enum class Mode { AUTO, ISO, SHUTTER, MANUAL }
+    private enum class DriveKind { SINGLE, BURST, BRACKET }
+    private data class Drive(val label: String, val kind: DriveKind, val evs: List<Double>)
+    private data class Exposure(val iso: Int, val time: Long)
+    private data class Frame(val name: String, val withJpeg: Boolean)
+
+    private val drives = listOf(
+        Drive("Simple", DriveKind.SINGLE, listOf(0.0)),
+        Drive("Ráfaga ×4", DriveKind.BURST, List(4) { 0.0 }),
+        Drive("Ráfaga ×8", DriveKind.BURST, List(8) { 0.0 }),
+        Drive("Ráfaga ×16", DriveKind.BURST, List(16) { 0.0 }),
+        Drive("Bracket ±1 ×3", DriveKind.BRACKET, listOf(-1.0, 0.0, 1.0)),
+        Drive("Bracket ±2 ×3", DriveKind.BRACKET, listOf(-2.0, 0.0, 2.0)),
+        Drive("Bracket ±2 ×5", DriveKind.BRACKET, listOf(-2.0, -1.0, 0.0, 1.0, 2.0)),
+    )
+    private val timers = listOf(0, 2, 10)
+
+    private lateinit var previewFrame: FrameLayout
     private lateinit var preview: TextureView
+    private lateinit var focusRing: View
+    private lateinit var lockBadge: TextView
+    private lateinit var countdownText: TextView
     private lateinit var info: TextView
-    private lateinit var autoSwitch: Switch
+    private lateinit var modeGroup: RadioGroup
+    private lateinit var evLabel: TextView
+    private lateinit var evBar: SeekBar
     private lateinit var isoLabel: TextView
     private lateinit var isoBar: SeekBar
     private lateinit var expLabel: TextView
     private lateinit var expBar: SeekBar
+    private lateinit var driveBtn: Button
+    private lateinit var timerBtn: Button
+    private lateinit var resetBtn: Button
     private lateinit var shutter: Button
 
     private val manager by lazy { getSystemService(CameraManager::class.java) }
     private val thread = HandlerThread("camera").apply { start() }
     private val handler = Handler(thread.looper)
+    private val ui = Handler(Looper.getMainLooper())
+    private val io = Executors.newSingleThreadExecutor()
 
     private lateinit var cameraId: String
     private lateinit var chars: CameraCharacteristics
     private lateinit var isoRange: Range<Int>
     private lateinit var expRange: Range<Long>
+    private lateinit var evRange: Range<Int>
+    private lateinit var evStep: Rational
+    private lateinit var activeArray: Rect
+    private var maxExposure = 1_000_000_000L
+    private var maxAfRegions = 0
+    private var maxAeRegions = 0
     private var sensorOrientation = 90
 
+    // Camera objects: only touched on the camera handler thread.
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
     private var previewSurface: Surface? = null
     private var rawReader: ImageReader? = null
     private var jpegReader: ImageReader? = null
 
-    @Volatile private var manual = false
+    @Volatile private var mode = Mode.AUTO
     @Volatile private var isoValue = 100
     @Volatile private var expValue = 10_000_000L
+    @Volatile private var evIndex = 0
+    @Volatile private var meteredIso = 100
+    @Volatile private var meteredExp = 10_000_000L
+    @Volatile private var focusRegion: MeteringRectangle? = null
+    @Volatile private var locked = false
+    @Volatile private var busy = false
+    @Volatile private var driveIndex = 0
+    private var timerIndex = 0
+    private var counting = false
+    private var countdownLeft = 0
 
-    // RAW image and its capture metadata arrive separately; DngCreator needs both.
-    private var pendingRaw: Image? = null
-    private var pendingResult: TotalCaptureResult? = null
+    // Capture sequence state: camera handler thread only. RAW images and their
+    // metadata arrive separately and are paired by sensor timestamp.
+    private val pendingImages = HashMap<Long, Image>()
+    private val pendingResults = HashMap<Long, TotalCaptureResult>()
+    private val queue = ArrayDeque<CaptureRequest>()
+    private var total = 0
+    private var done = 0
+    private var failed = 0
+    private var inFlight = 0
     private var stamp = ""
     private var frameCount = 0
     private var askedPermission = false
@@ -82,16 +146,25 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        previewFrame = findViewById(R.id.previewFrame)
         preview = findViewById(R.id.preview)
+        focusRing = findViewById(R.id.focusRing)
+        lockBadge = findViewById(R.id.lockBadge)
+        countdownText = findViewById(R.id.countdownText)
         info = findViewById(R.id.info)
-        autoSwitch = findViewById(R.id.autoSwitch)
+        modeGroup = findViewById(R.id.modeGroup)
+        evLabel = findViewById(R.id.evLabel)
+        evBar = findViewById(R.id.evBar)
         isoLabel = findViewById(R.id.isoLabel)
         isoBar = findViewById(R.id.isoBar)
         expLabel = findViewById(R.id.expLabel)
         expBar = findViewById(R.id.expBar)
+        driveBtn = findViewById(R.id.driveBtn)
+        timerBtn = findViewById(R.id.timerBtn)
+        resetBtn = findViewById(R.id.resetBtn)
         shutter = findViewById(R.id.shutter)
 
-        preview.layoutParams = preview.layoutParams.apply {
+        previewFrame.layoutParams = previewFrame.layoutParams.apply {
             height = resources.displayMetrics.widthPixels * 4 / 3
         }
 
@@ -101,18 +174,41 @@ class MainActivity : Activity() {
             return
         }
 
+        evBar.max = evRange.upper - evRange.lower
+        evBar.progress = -evRange.lower
+
         val bars = object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
-                // Touching a slider implies manual exposure; the switch listener re-syncs.
-                if (fromUser && autoSwitch.isChecked) autoSwitch.isChecked = false else syncControls()
-            }
+            override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) = syncControls()
             override fun onStartTrackingTouch(s: SeekBar) {}
             override fun onStopTrackingTouch(s: SeekBar) {}
         }
+        evBar.setOnSeekBarChangeListener(bars)
         isoBar.setOnSeekBarChangeListener(bars)
         expBar.setOnSeekBarChangeListener(bars)
-        autoSwitch.setOnCheckedChangeListener { _, _ -> syncControls() }
-        shutter.setOnClickListener { handler.post { capture() } }
+
+        modeGroup.setOnCheckedChangeListener { _, id ->
+            mode = when (id) {
+                R.id.modeIso -> Mode.ISO
+                R.id.modeShutter -> Mode.SHUTTER
+                R.id.modeManual -> Mode.MANUAL
+                else -> Mode.AUTO
+            }
+            syncControls()
+        }
+
+        driveBtn.setOnClickListener {
+            driveIndex = (driveIndex + 1) % drives.size
+            updateButtons()
+        }
+        timerBtn.setOnClickListener {
+            timerIndex = (timerIndex + 1) % timers.size
+            updateButtons()
+        }
+        resetBtn.setOnClickListener { resetFocus() }
+        shutter.setOnClickListener { onShutter() }
+
+        setupGestures()
+        updateButtons()
         syncControls()
     }
 
@@ -134,22 +230,36 @@ class MainActivity : Activity() {
     }
 
     override fun onPause() {
-        closeCamera()
+        cancelCountdown()
+        shutter.isEnabled = true
+        shutter.text = SHUTTER_LABEL
+        handler.post { closeCamera() }
         super.onPause()
     }
 
     override fun onDestroy() {
         thread.quitSafely()
+        io.shutdown()
         super.onDestroy()
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
+            if (event.repeatCount == 0) onShutter()
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
     }
 
     private fun startWhenReady() {
         if (preview.isAvailable) {
-            openCamera()
+            handler.post { openCamera() }
             return
         }
         preview.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-            override fun onSurfaceTextureAvailable(t: SurfaceTexture, w: Int, h: Int) = openCamera()
+            override fun onSurfaceTextureAvailable(t: SurfaceTexture, w: Int, h: Int) {
+                handler.post { openCamera() }
+            }
             override fun onSurfaceTextureSizeChanged(t: SurfaceTexture, w: Int, h: Int) {}
             override fun onSurfaceTextureDestroyed(t: SurfaceTexture) = true
             override fun onSurfaceTextureUpdated(t: SurfaceTexture) {}
@@ -168,23 +278,180 @@ class MainActivity : Activity() {
         chars = manager.getCameraCharacteristics(id)
         isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)!!
         expRange = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)!!
+        evRange = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE) ?: Range(0, 0)
+        evStep = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP) ?: Rational(1, 1)
+        activeArray = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)!!
+        maxAfRegions = chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0
+        maxAeRegions = chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
+        maxExposure = min(expRange.upper, 1_000_000_000L)
         sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
         return true
     }
 
+    // ---- UI ----
+
     private fun syncControls() {
-        manual = !autoSwitch.isChecked
-        isoBar.isEnabled = true
-        expBar.isEnabled = true
+        isoBar.isEnabled = mode == Mode.ISO || mode == Mode.MANUAL
+        expBar.isEnabled = mode == Mode.SHUTTER || mode == Mode.MANUAL
+        evBar.isEnabled = mode != Mode.MANUAL
 
         isoValue = logLerp(isoRange.lower.toDouble(), isoRange.upper.toDouble(), isoBar.progress / 1000.0).roundToInt()
-        val maxExp = min(expRange.upper, 1_000_000_000L).toDouble()
-        expValue = logLerp(expRange.lower.toDouble(), maxExp, expBar.progress / 1000.0).toLong()
+        expValue = logLerp(expRange.lower.toDouble(), maxExposure.toDouble(), expBar.progress / 1000.0).toLong()
+        evIndex = evBar.progress + evRange.lower
 
         isoLabel.text = "ISO $isoValue"
         expLabel.text = "Obturación ${formatExposure(expValue)}"
-        handler.post { updatePreview() }
+        evLabel.text = String.format(Locale.US, "Compensación %+.1f EV", evIndex * evStep.toDouble())
+
+        handler.removeCallbacks(previewUpdate)
+        handler.postDelayed(previewUpdate, 50)
     }
+
+    private val previewUpdate = Runnable { refreshPreview() }
+
+    private fun updateButtons() {
+        driveBtn.text = drives[driveIndex].label
+        val secs = timers[timerIndex]
+        timerBtn.text = if (secs == 0) "Timer: no" else "Timer: ${secs}s"
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun setupGestures() {
+        val detector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: MotionEvent): Boolean = true
+
+            override fun onSingleTapUp(e: MotionEvent): Boolean {
+                focusAt(e.x, e.y)
+                return true
+            }
+
+            override fun onLongPress(e: MotionEvent) = toggleLock()
+        })
+        preview.setOnTouchListener { _, e -> detector.onTouchEvent(e) }
+    }
+
+    private fun focusAt(x: Float, y: Float) {
+        if (maxAfRegions == 0 && maxAeRegions == 0) {
+            toast("Esta cámara no admite enfoque por toque")
+            return
+        }
+        focusRegion = regionFor(x, y)
+        locked = false
+        lockBadge.visibility = View.GONE
+        val size = focusRing.layoutParams.width
+        focusRing.translationX = x - size / 2f
+        focusRing.translationY = y - size / 2f
+        focusRing.visibility = View.VISIBLE
+        handler.post { refreshPreview(CaptureRequest.CONTROL_AF_TRIGGER_START) }
+    }
+
+    private fun toggleLock() {
+        locked = !locked
+        lockBadge.visibility = if (locked) View.VISIBLE else View.GONE
+        preview.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        val trigger = if (locked) CaptureRequest.CONTROL_AF_TRIGGER_START else CaptureRequest.CONTROL_AF_TRIGGER_CANCEL
+        handler.post { refreshPreview(trigger) }
+    }
+
+    private fun resetFocus() {
+        focusRegion = null
+        locked = false
+        focusRing.visibility = View.GONE
+        lockBadge.visibility = View.GONE
+        handler.post { refreshPreview(CaptureRequest.CONTROL_AF_TRIGGER_CANCEL) }
+    }
+
+    /** Maps a point on the portrait preview to a metering rectangle in sensor coordinates. */
+    private fun regionFor(x: Float, y: Float): MeteringRectangle {
+        val nx = (x / preview.width).coerceIn(0f, 1f)
+        val ny = (y / preview.height).coerceIn(0f, 1f)
+        val (sx, sy) = when (sensorOrientation) {
+            90 -> ny to 1f - nx
+            180 -> 1f - nx to 1f - ny
+            270 -> 1f - ny to nx
+            else -> nx to ny
+        }
+        val w = activeArray.width()
+        val h = activeArray.height()
+        val size = (min(w, h) * 0.1f).toInt()
+        val left = (sx * w - size / 2f).toInt().coerceIn(0, w - size)
+        val top = (sy * h - size / 2f).toInt().coerceIn(0, h - size)
+        return MeteringRectangle(left, top, size, size, MeteringRectangle.METERING_WEIGHT_MAX - 1)
+    }
+
+    private fun onShutter() {
+        if (counting) {
+            cancelCountdown()
+            return
+        }
+        if (busy) return
+        val secs = timers[timerIndex]
+        if (secs == 0) {
+            handler.post { startSequence() }
+            return
+        }
+        counting = true
+        countdownLeft = secs
+        countdownText.visibility = View.VISIBLE
+        ui.post(tick)
+    }
+
+    private val tick = object : Runnable {
+        override fun run() {
+            if (countdownLeft <= 0) {
+                counting = false
+                countdownText.visibility = View.GONE
+                handler.post { startSequence() }
+                return
+            }
+            countdownText.text = countdownLeft.toString()
+            countdownLeft--
+            ui.postDelayed(this, 1000)
+        }
+    }
+
+    private fun cancelCountdown() {
+        ui.removeCallbacks(tick)
+        counting = false
+        countdownLeft = 0
+        countdownText.visibility = View.GONE
+    }
+
+    // ---- Exposure ----
+
+    /** Exposure the still will use. Priority modes solve the free variable from the metered ISO×time product. */
+    private fun baseExposure(): Exposure {
+        val product = meteredIso.toDouble() * meteredExp
+        return when (mode) {
+            Mode.MANUAL -> Exposure(isoValue, expValue)
+            Mode.AUTO -> Exposure(meteredIso, meteredExp)
+            Mode.ISO -> withIso(product, isoValue)
+            Mode.SHUTTER -> withTime(product, expValue)
+        }
+    }
+
+    private fun shifted(e: Exposure, ev: Double) = withIso(e.iso.toDouble() * e.time * 2.0.pow(ev), e.iso)
+
+    private fun withIso(product: Double, iso: Int): Exposure {
+        val time = (product / iso).toLong().coerceIn(expRange.lower, maxExposure)
+        val finalIso = (product / time).roundToInt().coerceIn(isoRange.lower, isoRange.upper)
+        return Exposure(finalIso, time)
+    }
+
+    private fun withTime(product: Double, time: Long): Exposure {
+        val iso = (product / time).roundToInt().coerceIn(isoRange.lower, isoRange.upper)
+        val finalTime = (product / iso).toLong().coerceIn(expRange.lower, maxExposure)
+        return Exposure(iso, finalTime)
+    }
+
+    private fun modeLabel() = when (mode) {
+        Mode.AUTO -> "Auto"
+        Mode.ISO -> "Prioridad ISO"
+        Mode.SHUTTER -> "Prioridad obturación"
+        Mode.MANUAL -> "Manual"
+    }
+
+    // ---- Camera (handler thread) ----
 
     @SuppressLint("MissingPermission")
     private fun openCamera() {
@@ -197,11 +464,15 @@ class MainActivity : Activity() {
             .filter { it.width * 3 == it.height * 4 && it.width <= 1920 }
             .maxByOrNull { it.width } ?: Size(1440, 1080)
 
-        rawReader = ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, 2).apply {
+        rawReader = ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, MAX_IN_FLIGHT + 2).apply {
             setOnImageAvailableListener({ r -> r.acquireNextImage()?.let { onRaw(it) } }, handler)
         }
         jpegReader = ImageReader.newInstance(jpegSize.width, jpegSize.height, ImageFormat.JPEG, 2).apply {
-            setOnImageAvailableListener({ r -> r.acquireNextImage()?.let { saveJpeg(it) } }, handler)
+            setOnImageAvailableListener({ r ->
+                val image = r.acquireNextImage() ?: return@setOnImageAvailableListener
+                val name = "IMG_$stamp.jpg"
+                io.execute { saveJpeg(image, name) }
+            }, handler)
         }
 
         val texture = preview.surfaceTexture ?: return
@@ -234,99 +505,253 @@ class MainActivity : Activity() {
         d.createCaptureSession(targets, object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(s: CameraCaptureSession) {
                 session = s
-                updatePreview()
+                refreshPreview()
             }
 
             override fun onConfigureFailed(s: CameraCaptureSession) = toast("No se pudo configurar la sesión")
         }, handler)
     }
 
-    private fun CaptureRequest.Builder.applyExposure() {
-        set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-        set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-        if (manual) {
-            set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-            set(CaptureRequest.SENSOR_SENSITIVITY, isoValue)
-            set(CaptureRequest.SENSOR_EXPOSURE_TIME, expValue)
-            set(CaptureRequest.SENSOR_FRAME_DURATION, expValue)
+    private fun closeCamera() {
+        busy = false
+        pendingImages.values.forEach { it.close() }
+        pendingImages.clear()
+        pendingResults.clear()
+        queue.clear()
+        session?.close()
+        session = null
+        device?.close()
+        device = null
+        rawReader?.close()
+        rawReader = null
+        jpegReader?.close()
+        jpegReader = null
+        previewSurface?.release()
+        previewSurface = null
+    }
+
+    private fun CaptureRequest.Builder.applyFocus() {
+        val region = focusRegion
+        if (region != null && maxAfRegions > 0) {
+            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+            set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
         } else {
-            set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
         }
+        if (region != null && maxAeRegions > 0) set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
     }
 
-    private val previewCallback = object : CameraCaptureSession.CaptureCallback() {
-        override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, result: TotalCaptureResult) {
-            if (frameCount++ % 15 != 0) return
-            val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: return
-            val exp = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: return
-            val mode = if (manual) "Manual" else "Auto"
-            runOnUiThread { info.text = "$mode · Sensor: ISO $iso · ${formatExposure(exp)}" }
-        }
-    }
+    /**
+     * In manual mode, preview exposures longer than 1/30s are shortened and compensated
+     * with ISO so the viewfinder stays fluid. Other modes keep AE running for metering.
+     */
+    private fun previewRequest(trigger: Int?): CaptureRequest =
+        device!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+            addTarget(previewSurface!!)
+            set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+            applyFocus()
+            if (mode == Mode.MANUAL) {
+                var time = expValue
+                var iso = isoValue
+                if (time > PREVIEW_MAX_EXPOSURE_NS) {
+                    iso = (iso.toDouble() * time / PREVIEW_MAX_EXPOSURE_NS).roundToInt()
+                        .coerceIn(isoRange.lower, isoRange.upper)
+                    time = PREVIEW_MAX_EXPOSURE_NS
+                }
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                set(CaptureRequest.SENSOR_SENSITIVITY, iso)
+                set(CaptureRequest.SENSOR_EXPOSURE_TIME, time)
+                set(CaptureRequest.SENSOR_FRAME_DURATION, maxOf(time, PREVIEW_MAX_EXPOSURE_NS))
+            } else {
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, evIndex)
+                set(CaptureRequest.CONTROL_AE_LOCK, locked)
+            }
+            if (trigger != null) set(CaptureRequest.CONTROL_AF_TRIGGER, trigger)
+        }.build()
 
-    private fun updatePreview() {
-        val d = device ?: return
+    private fun refreshPreview(trigger: Int? = null) {
         val s = session ?: return
+        if (device == null || previewSurface == null) return
         try {
-            val req = d.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                addTarget(previewSurface!!)
-                applyExposure()
-            }.build()
-            s.setRepeatingRequest(req, previewCallback, handler)
+            if (trigger != null) s.capture(previewRequest(trigger), null, handler)
+            s.setRepeatingRequest(previewRequest(null), previewCallback, handler)
         } catch (e: Exception) {
             toast("Preview: ${e.message}")
         }
     }
 
-    private fun capture() {
-        val d = device ?: return
-        val s = session ?: return
-        runOnUiThread { shutter.isEnabled = false }
+    private val previewCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, result: TotalCaptureResult) {
+            val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: return
+            val time = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: return
+            if (result.get(CaptureResult.CONTROL_AE_MODE) != CaptureResult.CONTROL_AE_MODE_OFF) {
+                meteredIso = iso
+                meteredExp = time
+            }
+            if (frameCount++ % 10 != 0) return
+            val shot = baseExposure()
+            val text = "${modeLabel()} · Visor: ISO $iso · ${formatExposure(time)}\n" +
+                "Foto: ISO ${shot.iso} · ${formatExposure(shot.time)}"
+            runOnUiThread { info.text = text }
+        }
+    }
+
+    private fun stillRequest(e: Exposure, frame: Frame): CaptureRequest =
+        device!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+            addTarget(rawReader!!.surface)
+            if (frame.withJpeg) addTarget(jpegReader!!.surface)
+            set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+            applyFocus()
+            set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+            set(CaptureRequest.SENSOR_SENSITIVITY, e.iso)
+            set(CaptureRequest.SENSOR_EXPOSURE_TIME, e.time)
+            set(CaptureRequest.SENSOR_FRAME_DURATION, e.time)
+            set(CaptureRequest.JPEG_ORIENTATION, sensorOrientation)
+            set(CaptureRequest.JPEG_QUALITY, 95.toByte())
+            set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
+            set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY)
+            setTag(frame)
+        }.build()
+
+    // ---- Capture sequence (handler thread) ----
+
+    private fun startSequence() {
+        if (busy || session == null || device == null) return
+        val drive = drives[driveIndex]
+        val base = baseExposure()
         stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
 
-        try {
-            val req = d.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-                addTarget(rawReader!!.surface)
-                addTarget(jpegReader!!.surface)
-                applyExposure()
-                set(CaptureRequest.JPEG_ORIENTATION, sensorOrientation)
-                set(CaptureRequest.JPEG_QUALITY, 95.toByte())
-                set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
-                set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY)
-            }.build()
-
-            s.capture(req, object : CameraCaptureSession.CaptureCallback() {
-                override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, result: TotalCaptureResult) {
-                    pendingResult = result
-                    writeDngIfReady()
+        val requests = try {
+            drive.evs.mapIndexed { i, ev ->
+                val name = when (drive.kind) {
+                    DriveKind.SINGLE -> "RAW_$stamp.dng"
+                    DriveKind.BURST -> String.format(Locale.US, "RAW_%s_b%02d.dng", stamp, i + 1)
+                    DriveKind.BRACKET -> String.format(Locale.US, "RAW_%s_ev%+.1f.dng", stamp, ev)
                 }
-
-                override fun onCaptureFailed(s: CameraCaptureSession, r: CaptureRequest, f: android.hardware.camera2.CaptureFailure) {
-                    toast("Falló la captura")
-                    runOnUiThread { shutter.isEnabled = true }
-                }
-            }, handler)
+                val e = if (ev == 0.0) base else shifted(base, ev)
+                stillRequest(e, Frame(name, drive.kind == DriveKind.SINGLE))
+            }
         } catch (e: Exception) {
             toast("Captura: ${e.message}")
-            runOnUiThread { shutter.isEnabled = true }
+            return
+        }
+
+        queue.clear()
+        queue.addAll(requests)
+        total = requests.size
+        done = 0
+        failed = 0
+        inFlight = 0
+        busy = true
+        showProgress()
+        issueNext()
+    }
+
+    /** Keeps at most MAX_IN_FLIGHT frames between request and saved file, bounding RAW memory. */
+    private fun issueNext() {
+        val s = session ?: return
+        while (queue.isNotEmpty() && inFlight < MAX_IN_FLIGHT) {
+            val request = queue.removeFirst()
+            inFlight++
+            try {
+                s.capture(request, stillCallback, handler)
+            } catch (e: Exception) {
+                toast("Captura: ${e.message}")
+                inFlight--
+                val dropped = 1 + queue.size
+                queue.clear()
+                failed += dropped
+                done += dropped
+                if (inFlight == 0) finishSequence()
+                return
+            }
+        }
+    }
+
+    private val stillCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, result: TotalCaptureResult) {
+            if (!busy) return
+            val ts = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return
+            pendingResults[ts] = result
+            tryPair(ts)
+        }
+
+        override fun onCaptureFailed(s: CameraCaptureSession, r: CaptureRequest, f: CaptureFailure) {
+            if (!busy) return
+            inFlight--
+            failed++
+            frameDone()
         }
     }
 
     private fun onRaw(image: Image) {
-        pendingRaw?.close()
-        pendingRaw = image
-        writeDngIfReady()
+        if (!busy) {
+            image.close()
+            return
+        }
+        pendingImages[image.timestamp] = image
+        tryPair(image.timestamp)
     }
 
-    private fun writeDngIfReady() {
-        val image = pendingRaw ?: return
-        val result = pendingResult ?: return
-        pendingRaw = null
-        pendingResult = null
+    private fun tryPair(ts: Long) {
+        val image = pendingImages[ts] ?: return
+        val result = pendingResults[ts] ?: return
+        pendingImages.remove(ts)
+        pendingResults.remove(ts)
+        val frame = result.request.tag as? Frame ?: Frame("RAW_${stamp}_$ts.dng", false)
+        io.execute {
+            val ok = saveDng(image, result, frame)
+            handler.post {
+                if (!busy) return@post
+                inFlight--
+                if (!ok) failed++
+                frameDone()
+            }
+        }
+    }
 
-        try {
-            val name = "RAW_$stamp.dng"
-            val uri = insertImage(name, "image/x-adobe-dng")
+    private fun frameDone() {
+        done++
+        if (done >= total) finishSequence() else {
+            showProgress()
+            issueNext()
+        }
+    }
+
+    private fun finishSequence() {
+        busy = false
+        pendingImages.values.forEach { it.close() }
+        pendingImages.clear()
+        pendingResults.clear()
+        queue.clear()
+        val saved = total - failed
+        toast(
+            when {
+                total == 1 && failed == 0 -> "Guardado RAW_$stamp.dng"
+                total == 1 -> "Falló la captura"
+                else -> "Guardadas $saved/$total en DCIM/RawCam"
+            }
+        )
+        runOnUiThread {
+            shutter.isEnabled = true
+            shutter.text = SHUTTER_LABEL
+        }
+    }
+
+    private fun showProgress() {
+        val text = if (total > 1) "Capturando ${done + 1}/$total…" else "Capturando…"
+        runOnUiThread {
+            shutter.isEnabled = false
+            shutter.text = text
+        }
+    }
+
+    // ---- Saving (io thread) ----
+
+    private fun saveDng(image: Image, result: TotalCaptureResult, frame: Frame): Boolean {
+        return try {
+            val uri = insertImage(frame.name, "image/x-adobe-dng")
             contentResolver.openOutputStream(uri)!!.use { out ->
                 val (dngChars, dngResult) = dngSource(result)
                 DngCreator(dngChars, dngResult).use { dng ->
@@ -335,12 +760,12 @@ class MainActivity : Activity() {
                 }
             }
             publish(uri)
-            toast("Guardado $name")
+            true
         } catch (e: Exception) {
             toast("DNG: ${e.message}")
+            false
         } finally {
             image.close()
-            runOnUiThread { shutter.isEnabled = true }
         }
     }
 
@@ -357,15 +782,16 @@ class MainActivity : Activity() {
             manager.getCameraCharacteristics(id).get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT1) != null
         } ?: return chars to result
 
+        @Suppress("DEPRECATION")
         val physResult = result.physicalCameraResults[physId] ?: result
         return manager.getCameraCharacteristics(physId) to physResult
     }
 
-    private fun saveJpeg(image: Image) {
+    private fun saveJpeg(image: Image, name: String) {
         try {
             val buffer = image.planes[0].buffer
             val bytes = ByteArray(buffer.remaining()).also { buffer.get(it) }
-            val uri = insertImage("IMG_$stamp.jpg", "image/jpeg")
+            val uri = insertImage(name, "image/jpeg")
             contentResolver.openOutputStream(uri)!!.use { it.write(bytes) }
             publish(uri)
         } catch (e: Exception) {
@@ -396,20 +822,6 @@ class MainActivity : Activity() {
         else -> ExifInterface.ORIENTATION_NORMAL
     }
 
-    private fun closeCamera() {
-        session?.close()
-        session = null
-        device?.close()
-        device = null
-        rawReader?.close()
-        rawReader = null
-        jpegReader?.close()
-        jpegReader = null
-        pendingRaw?.close()
-        pendingRaw = null
-        pendingResult = null
-    }
-
     private fun logLerp(lo: Double, hi: Double, t: Double) = exp(ln(lo) + (ln(hi) - ln(lo)) * t)
 
     private fun formatExposure(ns: Long): String =
@@ -417,4 +829,10 @@ class MainActivity : Activity() {
         else "1/${(1e9 / ns).roundToInt()}s"
 
     private fun toast(msg: String) = runOnUiThread { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
+
+    companion object {
+        private const val PREVIEW_MAX_EXPOSURE_NS = 33_333_333L
+        private const val MAX_IN_FLIGHT = 3
+        private const val SHUTTER_LABEL = "Capturar"
+    }
 }
