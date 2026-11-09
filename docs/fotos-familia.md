@@ -11,19 +11,19 @@ Estado:
 
 ## Prioridades
 
-| # | Mejora | Dificultad | Etapa |
-|---|---|---|---|
-| 1 | Timer de grupo | Baja | 1 |
-| 2 | Modo niños | Baja | 1 |
-| 3 | Disparo con sonrisa | Media | 1 |
-| 4 | Mejor toma de grupo | Media | 2 |
-| 5 | Retrato con fondo desenfocado | Media | 2 |
-| 6 | Disparo con gesto | Media | 3 |
+| # | Mejora | Dificultad | Etapa | Estado |
+|---|---|---|---|---|
+| 1 | Timer de grupo | Baja | 1 | ✅ Hecho |
+| 2 | Modo niños | Baja | 1 | ✅ Hecho |
+| 3 | Disparo con sonrisa | Media | 1 | ⏳ Pendiente |
+| 4 | Mejor toma de grupo | Media | 2 | ✅ Hecho |
+| 5 | Retrato con fondo desenfocado | Media | 2 | ⏳ Pendiente |
+| 6 | Disparo con gesto | Media | 3 | ✅ Hecho |
 
 Las tres primeras reutilizan la detección de caras que ya existe (`handleFaces`,
 `STATISTICS_FACES`).
 
-## 1. Timer de grupo
+## 1. Timer de grupo ✅
 **Problema:** con el timer de 10 s hay que correr para salir en la foto.
 
 **Cómo:**
@@ -33,8 +33,10 @@ Las tres primeras reutilizan la detección de caras que ya existe (`handleFaces`
   para elegir la mejor.
 - Tiempo máximo de espera (p. ej. 30 s), con aviso si nadie entra.
 - Base: la detección de caras de Camera2 alcanza para contar, no requiere ML Kit.
+- Si la cámara no detecta caras, cae a un timer de 10 s. Tocar el disparador mientras espera
+  cancela.
 
-## 2. Modo niños
+## 2. Modo niños ✅
 **Problema:** los niños se mueven y en interiores la foto sale movida.
 
 **Cómo:** un preset que configura:
@@ -42,10 +44,11 @@ Las tres primeras reutilizan la detección de caras que ya existe (`handleFaces`
 - Seguimiento de caras activado.
 - Ráfaga ×4 con "solo la mejor".
 - "Esperar quietud" desactivado: se mueve el sujeto, no el celu.
-- Opcional: subir el umbral a 1/500 s si se detecta movimiento rápido. Esto puede venir del
+- Al desactivarlo vuelve a Auto, disparo simple y "Esperar quietud".
+- Pendiente: subir el umbral a 1/500 s si se detecta movimiento rápido. Esto puede venir del
   análisis de la vista previa (diferencia entre cuadros) o de que las caras se desplacen rápido.
 
-## 3. Disparo con sonrisa
+## 3. Disparo con sonrisa ⏳
 **Cómo:**
 - **ML Kit Face Detection** con clasificación activada: da por cara `smilingProbability`,
   `leftEyeOpenProbability` y `rightEyeOpenProbability`.
@@ -55,15 +58,19 @@ Las tres primeras reutilizan la detección de caras que ya existe (`handleFaces`
 - Indicador sobre cada cara (😊 / 😐 / ojos cerrados) para que el fotógrafo vea quién falta.
 - Dependencia nueva: `com.google.mlkit:face-detection`.
 
-## 4. Mejor toma de grupo
-- Extiende el "mejor cuadro de la ráfaga" actual (`rawSharpness` + `reportBest`).
-- Puntaje por cuadro = nitidez × (fracción de caras con ojos abiertos) × (sonrisa media).
-- Para puntuar las caras hace falta una imagen: generar una miniatura del RAW o usar el JPEG si
-  se guardó, y pasarla por ML Kit Face Detection.
+## 4. Mejor toma de grupo ✅
+- Extiende el "mejor cuadro de la ráfaga" (`rawSharpness` + `reportBest`).
+- Si al disparar hay caras en cuadro, cada cuadro de la ráfaga captura también un JPEG. Se
+  decodifica a 1/4 de resolución y se pasa por ML Kit Face Detection (`groupScore`).
+- Factor de grupo = (ojos abiertos medios) × (0.8 + 0.2 × sonrisa media).
+- Puntaje = nitidez × (0.3 + 0.7 × factor de grupo): la nitidez sigue pesando, pero un parpadeo
+  baja mucho la toma.
+- Con "Ráfaga: solo la mejor" se borran el RAW y el JPEG de las demás. En Solo RAW el JPEG se usa
+  para medir y no se guarda.
 - Futuro (complejo): componer la mejor cara de cada persona desde distintos cuadros (*best take*).
   Requiere alinear y fusionar regiones; comparte base con `docs/apilado-alineado.md`.
 
-## 5. Retrato con fondo desenfocado
+## 5. Retrato con fondo desenfocado ⏳
 - **ML Kit Selfie Segmentation** separa persona y fondo, y funciona también con la cámara trasera.
 - Sobre el JPEG: desenfoque gaussiano del fondo, con radio proporcional a la distancia de enfoque
   (la distancia ya se calcula a partir de `LENS_FOCUS_DISTANCE`).
@@ -72,11 +79,14 @@ Las tres primeras reutilizan la detección de caras que ya existe (`handleFaces`
   tocan.
 - **Limitación:** pelo suelto y objetos que sostiene la persona pueden quedar mal recortados.
 
-## 6. Disparo con gesto
-- Levantar la palma frente a la cámara inicia el timer de 2 s.
-- **ML Kit Pose Detection** (o un detector de manos) sobre la vista previa reducida.
+## 6. Disparo con gesto ✅
+- Levantar una mano por encima de la cabeza (muñeca por encima de la nariz) inicia el timer de
+  2 s, con vibración y aviso.
+- **ML Kit Pose Detection** en modo stream sobre la vista previa reducida, unas 4 veces por segundo.
+- Para evitar disparos accidentales, la mano tiene que mantenerse 0.5 s, y después del disparo hay
+  4 s sin aceptar otro gesto.
+- Detecta a una sola persona (la más visible); funciona mejor de la cintura para arriba, a 1–4 m.
 - Útil cuando el celu está lejos, en un trípode o apoyado.
-- Para evitar disparos accidentales, la palma tiene que mantenerse unos 0.5 s.
 
 ## Flujo de uso típico
 - **Foto de grupo con vos incluido:** celu apoyado → Timer de grupo → te sumás → la app espera
