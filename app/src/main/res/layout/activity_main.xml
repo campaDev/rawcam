@@ -361,6 +361,31 @@
                 android:orientation="horizontal">
 
                 <CheckBox
+                    android:id="@+id/steadyToggle"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:checked="true"
+                    android:text="Esperar quietud"
+                    android:textColor="#FFFFFF"
+                    android:textSize="12sp" />
+
+                <CheckBox
+                    android:id="@+id/bestToggle"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Ráfaga: solo la mejor"
+                    android:textColor="#FFFFFF"
+                    android:textSize="12sp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <CheckBox
                     android:id="@+id/lensToggle"
                     android:layout_width="0dp"
                     android:layout_height="wrap_content"

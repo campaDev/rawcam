@@ -83,7 +83,10 @@ class MainActivity : Activity() {
         val location: Location?,
         val stack: Boolean = false,
         val infinity: Boolean = false,
+        val scored: Boolean = false,
     )
+
+    private class ScoredShot(val base: String, val uri: Uri, val score: Float)
 
     private enum class SaveFormat(val label: String) {
         BOTH("RAW + JPEG"),
@@ -163,6 +166,29 @@ class MainActivity : Activity() {
     private lateinit var lensDebug: TextView
 
     private class LensStats(val haze: Float, val contrast: Float, val glow: Float, val meanLuma: Float)
+
+    private lateinit var steadyToggle: CheckBox
+    private lateinit var bestToggle: CheckBox
+
+    // Hand shake from the gyroscope (UI thread), and the derived longest safe exposure.
+    private val gyroWindow = FloatArray(GYRO_WINDOW)
+    private var gyroPos = 0
+    private var gyroFilled = 0
+    private var gyroEma = 0f
+    private var hasGyro = false
+    @Volatile private var safeExposureNs = Long.MAX_VALUE
+    @Volatile private var gyroRms = 1f
+    private var focalPx = 0f
+    private var waitingSteady = false
+    private var steadySince = 0L
+    private var steadyDeadline = 0L
+
+    // Burst sharpness scores: io thread only.
+    private val scoredShots = ArrayList<ScoredShot>()
+
+    // Camera handler thread only.
+    private var burstSequence = false
+    @Volatile private var bestOnly = false
 
     @Volatile private var afFocused = false
     private var focusCalibrated = false
@@ -316,6 +342,9 @@ class MainActivity : Activity() {
         locationToggle = findViewById(R.id.locationToggle)
         intervalBtn = findViewById(R.id.intervalBtn)
         shotsBtn = findViewById(R.id.shotsBtn)
+        steadyToggle = findViewById(R.id.steadyToggle)
+        bestToggle = findViewById(R.id.bestToggle)
+        bestToggle.setOnCheckedChangeListener { _, checked -> bestOnly = checked }
         lensToggle = findViewById(R.id.lensToggle)
         distanceToggle = findViewById(R.id.distanceToggle)
         distanceBadge = findViewById(R.id.distanceBadge)
@@ -445,6 +474,9 @@ class MainActivity : Activity() {
         sensors.getDefaultSensor(Sensor.TYPE_GRAVITY)?.let {
             sensors.registerListener(levelListener, it, SensorManager.SENSOR_DELAY_UI)
         }
+        val gyro = sensors.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+        hasGyro = gyro != null
+        gyro?.let { sensors.registerListener(gyroListener, it, SensorManager.SENSOR_DELAY_GAME) }
         ui.post(grabTick)
         if (useLocation && hasLocationPermission()) startLocation()
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
@@ -505,8 +537,10 @@ class MainActivity : Activity() {
 
     override fun onPause() {
         stopInterval()
+        cancelSteady()
         stopLocation()
         sensors.unregisterListener(levelListener)
+        sensors.unregisterListener(gyroListener)
         ui.removeCallbacks(grabTick)
         cancelCountdown()
         shutter.isEnabled = true
@@ -625,6 +659,12 @@ class MainActivity : Activity() {
         nrModes = chars.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES)?.toSet() ?: emptySet()
         focusCalibrated = chars.get(CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION) !=
             CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION_UNCALIBRATED
+        val focalMm = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: 0f
+        val physical = chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+        val pixelArray = chars.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
+        focalPx = if (physical != null && pixelArray != null && physical.width > 0f) {
+            focalMm * pixelArray.width / physical.width
+        } else 0f
         isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)!!
         expRange = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)!!
         evRange = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE) ?: Range(0, 0)
@@ -762,6 +802,10 @@ class MainActivity : Activity() {
             stopInterval()
             return
         }
+        if (waitingSteady) {
+            cancelSteady()
+            return
+        }
         if (counting) {
             cancelCountdown()
             return
@@ -773,7 +817,7 @@ class MainActivity : Activity() {
         }
         val secs = timers[timerIndex]
         if (secs == 0) {
-            handler.post { startSequence() }
+            fire()
             return
         }
         counting = true
@@ -787,7 +831,7 @@ class MainActivity : Activity() {
             if (countdownLeft <= 0) {
                 counting = false
                 countdownText.visibility = View.GONE
-                handler.post { startSequence() }
+                fire()
                 return
             }
             countdownText.text = countdownLeft.toString()
@@ -863,6 +907,84 @@ class MainActivity : Activity() {
         }
 
         override fun onAccuracyChanged(s: Sensor, accuracy: Int) {}
+    }
+
+    /**
+     * Angular speed (rad/s) feeds both the steady-shutter wait and the safe-exposure estimate:
+     * blur in pixels ≈ ω · t · focal length in pixels, so t_safe = allowed blur / (ω_rms · f_px).
+     */
+    private val gyroListener = object : SensorEventListener {
+        override fun onSensorChanged(e: SensorEvent) {
+            val x = e.values[0]
+            val y = e.values[1]
+            val z = e.values[2]
+            val magnitude = kotlin.math.sqrt(x * x + y * y + z * z)
+            gyroEma += (magnitude - gyroEma) * 0.3f
+            gyroWindow[gyroPos] = magnitude
+            gyroPos = (gyroPos + 1) % GYRO_WINDOW
+            if (gyroFilled < GYRO_WINDOW) gyroFilled++
+
+            var sq = 0f
+            for (i in 0 until gyroFilled) sq += gyroWindow[i] * gyroWindow[i]
+            val rms = kotlin.math.sqrt(sq / gyroFilled).coerceAtLeast(GYRO_NOISE_FLOOR)
+            gyroRms = rms
+            val fPx = focalPx * zoomRatio
+            safeExposureNs = if (fPx > 0f) (ALLOWED_BLUR_PX / (rms * fPx) * 1e9).toLong() else Long.MAX_VALUE
+        }
+
+        override fun onAccuracyChanged(s: Sensor, accuracy: Int) {}
+    }
+
+    private fun handHoldText(photoNs: Long): String {
+        if (!hasGyro || focalPx <= 0f) return ""
+        val safe = safeExposureNs
+        if (gyroRms < STABLE_RMS) return "\nPulso: estable (trípode o apoyado)"
+        val warn = if (photoNs > safe) "  ⚠ va a salir movida" else "  ✓"
+        return "\nPulso: segura ≤ ${formatExposure(safe)}$warn"
+    }
+
+    /** Starts the capture, optionally waiting (up to a limit) until the phone is held still. */
+    private fun fire() {
+        if (!steadyToggle.isChecked || !hasGyro) {
+            handler.post { startSequence() }
+            return
+        }
+        waitingSteady = true
+        steadySince = 0L
+        steadyDeadline = android.os.SystemClock.uptimeMillis() + STEADY_MAX_WAIT_MS
+        shutter.text = "Esperando quietud…"
+        ui.post(steadyTick)
+    }
+
+    private val steadyTick = object : Runnable {
+        override fun run() {
+            if (!waitingSteady) return
+            val now = android.os.SystemClock.uptimeMillis()
+            if (gyroEma < STEADY_LIMIT) {
+                if (steadySince == 0L) steadySince = now
+                if (now - steadySince >= STEADY_HOLD_MS) {
+                    waitingSteady = false
+                    handler.post { startSequence() }
+                    return
+                }
+            } else {
+                steadySince = 0L
+            }
+            if (now >= steadyDeadline) {
+                waitingSteady = false
+                toast("No se logró quietud: disparo igual")
+                handler.post { startSequence() }
+                return
+            }
+            ui.postDelayed(this, 30)
+        }
+    }
+
+    private fun cancelSteady() {
+        if (!waitingSteady) return
+        waitingSteady = false
+        ui.removeCallbacks(steadyTick)
+        updateShutterIdle()
     }
 
     private fun needsAnalysis() =
@@ -1291,7 +1413,7 @@ class MainActivity : Activity() {
             if (frameCount++ % 10 != 0) return
             val shot = baseExposure()
             val text = "${modeLabel()} · Visor: ISO $iso · ${formatExposure(time)}\n" +
-                "Foto: ISO ${shot.iso} · ${formatExposure(shot.time)}"
+                "Foto: ISO ${shot.iso} · ${formatExposure(shot.time)}" + handHoldText(shot.time)
             val distance = distanceText(
                 result.get(CaptureResult.LENS_FOCUS_DISTANCE),
                 result.get(CaptureResult.LENS_FOCUS_RANGE),
@@ -1367,7 +1489,8 @@ class MainActivity : Activity() {
                     DriveKind.STACK -> stamp
                 }
                 val e = if (ev == 0.0) baseExp else shifted(baseExp, ev)
-                stillRequest(e, Frame(base, !jpegOnly, withJpeg, location, stack = isStack, infinity = drive.infinity))
+                val scored = drive.kind == DriveKind.BURST && !jpegOnly
+                stillRequest(e, Frame(base, !jpegOnly, withJpeg, location, isStack, drive.infinity, scored))
             }
         } catch (e: Exception) {
             toast("Captura: ${e.message}")
@@ -1382,7 +1505,9 @@ class MainActivity : Activity() {
         inFlight = 0
         stackSequence = isStack
         stackBase = stamp
+        burstSequence = drive.kind == DriveKind.BURST && !jpegOnly
         if (isStack) io.execute { resetStack() }
+        if (burstSequence) io.execute { scoredShots.clear() }
         busy = true
         showProgress()
         issueNext()
@@ -1488,13 +1613,73 @@ class MainActivity : Activity() {
                 val base = stackBase
                 io.execute { writeStack(base) }
             }
+            burstSequence -> {
+                val keepOnlyBest = bestOnly
+                io.execute { reportBest(keepOnlyBest) }
+            }
             intervalShot > 0 -> Unit
             total == 1 && failed == 0 -> toast("Guardado en DCIM/RawCam")
             total == 1 -> toast("Falló la captura")
             else -> toast("Guardadas $saved/$total en DCIM/RawCam")
         }
         stackSequence = false
+        burstSequence = false
         runOnUiThread { updateShutterIdle() }
+    }
+
+    // ---- Best burst frame (io thread) ----
+
+    /**
+     * Sharpness of a RAW_SENSOR frame: mean absolute difference between same-colour Bayer
+     * neighbours (x and x+2) over the central half, normalised by brightness so it does not
+     * depend on exposure. Every 8th row is sampled to keep it fast.
+     */
+    private fun rawSharpness(image: Image): Float {
+        val plane = image.planes[0]
+        val shorts = plane.buffer.order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+        val rowShorts = plane.rowStride / 2
+        val w = image.width
+        val h = image.height
+        var grad = 0.0
+        var sum = 0.0
+        var y = h / 4
+        while (y < 3 * h / 4) {
+            val row = y * rowShorts
+            var x = w / 4
+            while (x < 3 * w / 4 - 2) {
+                val a = shorts.get(row + x).toInt() and 0xFFFF
+                val b = shorts.get(row + x + 2).toInt() and 0xFFFF
+                grad += abs(a - b)
+                sum += a
+                x += 2
+            }
+            y += 8
+        }
+        return (grad / (sum + 1.0)).toFloat()
+    }
+
+    private fun reportBest(keepOnlyBest: Boolean) {
+        if (scoredShots.isEmpty()) return
+        val best = scoredShots.maxBy { it.score }
+        val worst = scoredShots.minBy { it.score }
+        val worstPct = (worst.score / best.score * 100).roundToInt()
+        val label = best.base.substringAfterLast('_')
+        if (keepOnlyBest) {
+            var removed = 0
+            for (shot in scoredShots) {
+                if (shot !== best) {
+                    try {
+                        removed += contentResolver.delete(shot.uri, null, null)
+                    } catch (e: Exception) {
+                        // Leave the file if MediaStore refuses; the best one is still reported.
+                    }
+                }
+            }
+            toast("Guardada solo la más nítida ($label). Descartadas: $removed")
+        } else {
+            toast("Más nítida: $label · la peor tiene $worstPct% de su nitidez")
+        }
+        scoredShots.clear()
     }
 
     private fun showProgress() {
@@ -1592,6 +1777,7 @@ class MainActivity : Activity() {
 
     private fun saveDng(image: Image, result: TotalCaptureResult, frame: Frame): Boolean {
         return try {
+            val score = if (frame.scored) rawSharpness(image) else 0f
             val uri = insertImage("RAW_${frame.base}.dng", "image/x-adobe-dng")
             contentResolver.openOutputStream(uri)!!.use { out ->
                 val (dngChars, dngResult) = dngSource(result)
@@ -1602,6 +1788,7 @@ class MainActivity : Activity() {
                 }
             }
             publish(uri)
+            if (frame.scored) scoredShots.add(ScoredShot(frame.base, uri, score))
             true
         } catch (e: Exception) {
             toast("DNG: ${e.message}")
@@ -1685,6 +1872,14 @@ class MainActivity : Activity() {
         private const val HAZE_LIMIT = 0.16f
         private const val CONTRAST_LIMIT = 0.22f
         private const val GLOW_LIMIT = 0.50f
+
+        private const val GYRO_WINDOW = 50
+        private const val GYRO_NOISE_FLOOR = 0.002f
+        private const val STABLE_RMS = 0.005f
+        private const val ALLOWED_BLUR_PX = 2f
+        private const val STEADY_LIMIT = 0.035f
+        private const val STEADY_HOLD_MS = 300L
+        private const val STEADY_MAX_WAIT_MS = 4000L
         private const val ANALYSIS_W = 360
         private const val ANALYSIS_H = 480
         private const val ANALYSIS_INTERVAL_MS = 125L
