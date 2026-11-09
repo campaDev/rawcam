@@ -9,6 +9,9 @@ import android.graphics.Bitmap
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.SurfaceTexture
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -70,7 +73,13 @@ class MainActivity : Activity() {
     private enum class DriveKind { SINGLE, BURST, BRACKET }
     private data class Drive(val label: String, val kind: DriveKind, val evs: List<Double>)
     private data class Exposure(val iso: Int, val time: Long)
-    private data class Frame(val name: String, val withJpeg: Boolean)
+    private data class Frame(val base: String, val withRaw: Boolean, val withJpeg: Boolean, val location: Location?)
+
+    private enum class SaveFormat(val label: String) {
+        BOTH("RAW + JPEG"),
+        RAW("Solo RAW"),
+        JPEG("Solo JPEG"),
+    }
     private data class Lens(val id: String, val zoom: Float, val label: String)
 
     private enum class Wb(val label: String, val awb: Int) {
@@ -123,6 +132,21 @@ class MainActivity : Activity() {
     private lateinit var lensBtn: Button
     private lateinit var kelvinLabel: TextView
     private lateinit var kelvinBar: SeekBar
+
+    private lateinit var formatBtn: Button
+    private lateinit var qualityBtn: Button
+    private lateinit var processBtn: Button
+    private lateinit var locationToggle: CheckBox
+
+    private val qualities = listOf(85, 90, 95, 100)
+    private var qualityIndex = 2
+    @Volatile private var saveFormat = SaveFormat.BOTH
+    @Volatile private var jpegQuality = 95
+    @Volatile private var naturalJpeg = false
+    @Volatile private var useLocation = false
+    @Volatile private var lastLocation: Location? = null
+    private var nrModes: Set<Int> = emptySet()
+    private val locationManager by lazy { getSystemService(LocationManager::class.java) }
 
     private val lenses = ArrayList<Lens>()
     private var lensIndex = 0
@@ -192,6 +216,7 @@ class MainActivity : Activity() {
     // Capture sequence state: camera handler thread only. RAW images and their
     // metadata arrive separately and are paired by sensor timestamp.
     private val pendingImages = HashMap<Long, Image>()
+    private val pendingJpegs = HashMap<Long, Image>()
     private val pendingResults = HashMap<Long, TotalCaptureResult>()
     private val queue = ArrayDeque<CaptureRequest>()
     private var total = 0
@@ -235,6 +260,38 @@ class MainActivity : Activity() {
         lensBtn = findViewById(R.id.lensBtn)
         kelvinLabel = findViewById(R.id.kelvinLabel)
         kelvinBar = findViewById(R.id.kelvinBar)
+        formatBtn = findViewById(R.id.formatBtn)
+        qualityBtn = findViewById(R.id.qualityBtn)
+        processBtn = findViewById(R.id.processBtn)
+        locationToggle = findViewById(R.id.locationToggle)
+
+        formatBtn.setOnClickListener {
+            saveFormat = SaveFormat.values()[(saveFormat.ordinal + 1) % SaveFormat.values().size]
+            updateButtons()
+        }
+        qualityBtn.setOnClickListener {
+            qualityIndex = (qualityIndex + 1) % qualities.size
+            jpegQuality = qualities[qualityIndex]
+            updateButtons()
+        }
+        processBtn.setOnClickListener {
+            naturalJpeg = !naturalJpeg
+            updateButtons()
+        }
+        locationToggle.setOnCheckedChangeListener { _, checked ->
+            useLocation = checked
+            if (!checked) {
+                stopLocation()
+                lastLocation = null
+            } else if (hasLocationPermission()) {
+                startLocation()
+            } else {
+                requestPermissions(
+                    arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
+                    REQUEST_LOCATION,
+                )
+            }
+        }
 
         gridToggle.setOnCheckedChangeListener { _, checked -> overlay.showGrid = checked }
         val analysisToggle = { _: android.widget.CompoundButton, _: Boolean ->
@@ -308,6 +365,7 @@ class MainActivity : Activity() {
             sensors.registerListener(levelListener, it, SensorManager.SENSOR_DELAY_UI)
         }
         ui.post(grabTick)
+        if (useLocation && hasLocationPermission()) startLocation()
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             if (!askedPermission) {
                 askedPermission = true
@@ -319,11 +377,53 @@ class MainActivity : Activity() {
     }
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<String>, results: IntArray) {
+        if (code == REQUEST_LOCATION) {
+            if (results.any { it == PackageManager.PERMISSION_GRANTED }) {
+                startLocation()
+            } else {
+                locationToggle.isChecked = false
+                toast("Sin permiso de ubicación")
+            }
+            return
+        }
         if (results.firstOrNull() == PackageManager.PERMISSION_GRANTED) startWhenReady()
         else toast("Se necesita permiso de cámara")
     }
 
+    private fun hasLocationPermission() =
+        checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+            checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+
+    private val locationListener = object : LocationListener {
+        override fun onLocationChanged(location: Location) {
+            lastLocation = location
+        }
+
+        override fun onProviderEnabled(provider: String) {}
+        override fun onProviderDisabled(provider: String) {}
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startLocation() {
+        if (!hasLocationPermission()) return
+        stopLocation()
+        for (provider in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+            try {
+                if (!locationManager.isProviderEnabled(provider)) continue
+                locationManager.requestLocationUpdates(provider, 5000L, 10f, locationListener, Looper.getMainLooper())
+                if (lastLocation == null) lastLocation = locationManager.getLastKnownLocation(provider)
+            } catch (e: Exception) {
+                // Provider unavailable on this device; keep trying the others.
+            }
+        }
+    }
+
+    private fun stopLocation() {
+        locationManager.removeUpdates(locationListener)
+    }
+
     override fun onPause() {
+        stopLocation()
         sensors.unregisterListener(levelListener)
         ui.removeCallbacks(grabTick)
         cancelCountdown()
@@ -440,6 +540,7 @@ class MainActivity : Activity() {
             }
         }
         lastTransform = null
+        nrModes = chars.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES)?.toSet() ?: emptySet()
         isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)!!
         expRange = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)!!
         evRange = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE) ?: Range(0, 0)
@@ -497,6 +598,11 @@ class MainActivity : Activity() {
         wbBtn.text = wbOptions.getOrElse(wbIndex) { Wb.AUTO }.label
         lensBtn.text = "Lente: ${lenses.getOrNull(lensIndex)?.label ?: "-"}"
         lensBtn.isEnabled = lenses.size > 1
+        formatBtn.text = saveFormat.label
+        qualityBtn.text = "JPEG $jpegQuality%"
+        qualityBtn.isEnabled = saveFormat != SaveFormat.RAW
+        processBtn.text = if (naturalJpeg) "JPEG natural" else "JPEG estándar"
+        processBtn.isEnabled = saveFormat != SaveFormat.RAW
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -734,12 +840,8 @@ class MainActivity : Activity() {
         rawReader = ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, MAX_IN_FLIGHT + 2).apply {
             setOnImageAvailableListener({ r -> r.acquireNextImage()?.let { onRaw(it) } }, handler)
         }
-        jpegReader = ImageReader.newInstance(jpegSize.width, jpegSize.height, ImageFormat.JPEG, 2).apply {
-            setOnImageAvailableListener({ r ->
-                val image = r.acquireNextImage() ?: return@setOnImageAvailableListener
-                val name = "IMG_$stamp.jpg"
-                io.execute { saveJpeg(image, name) }
-            }, handler)
+        jpegReader = ImageReader.newInstance(jpegSize.width, jpegSize.height, ImageFormat.JPEG, MAX_IN_FLIGHT + 2).apply {
+            setOnImageAvailableListener({ r -> r.acquireNextImage()?.let { onJpeg(it) } }, handler)
         }
 
         val texture = preview.surfaceTexture ?: return
@@ -783,6 +885,8 @@ class MainActivity : Activity() {
         busy = false
         pendingImages.values.forEach { it.close() }
         pendingImages.clear()
+        pendingJpegs.values.forEach { it.close() }
+        pendingJpegs.clear()
         pendingResults.clear()
         queue.clear()
         session?.close()
@@ -916,7 +1020,7 @@ class MainActivity : Activity() {
 
     private fun stillRequest(e: Exposure, frame: Frame): CaptureRequest =
         device!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-            addTarget(rawReader!!.surface)
+            if (frame.withRaw) addTarget(rawReader!!.surface)
             if (frame.withJpeg) addTarget(jpegReader!!.surface)
             set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
             applyCommon()
@@ -925,9 +1029,21 @@ class MainActivity : Activity() {
             set(CaptureRequest.SENSOR_EXPOSURE_TIME, e.time)
             set(CaptureRequest.SENSOR_FRAME_DURATION, e.time)
             set(CaptureRequest.JPEG_ORIENTATION, sensorOrientation)
-            set(CaptureRequest.JPEG_QUALITY, 95.toByte())
-            set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
-            set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY)
+            set(CaptureRequest.JPEG_QUALITY, jpegQuality.toByte())
+            frame.location?.let { set(CaptureRequest.JPEG_GPS_LOCATION, it) }
+            if (naturalJpeg) {
+                // Natural look: minimal denoise (falls back to off) and no sharpening.
+                val nr = when {
+                    CaptureRequest.NOISE_REDUCTION_MODE_MINIMAL in nrModes -> CaptureRequest.NOISE_REDUCTION_MODE_MINIMAL
+                    CaptureRequest.NOISE_REDUCTION_MODE_OFF in nrModes -> CaptureRequest.NOISE_REDUCTION_MODE_OFF
+                    else -> CaptureRequest.NOISE_REDUCTION_MODE_FAST
+                }
+                set(CaptureRequest.NOISE_REDUCTION_MODE, nr)
+                set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF)
+            } else {
+                set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
+                set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY)
+            }
             setTag(frame)
         }.build()
 
@@ -936,18 +1052,23 @@ class MainActivity : Activity() {
     private fun startSequence() {
         if (busy || session == null || device == null) return
         val drive = drives[driveIndex]
-        val base = baseExposure()
+        val baseExp = baseExposure()
         stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+
+        // Bursts and brackets stay RAW-only unless the user chose JPEG only.
+        val jpegOnly = saveFormat == SaveFormat.JPEG
+        val withJpeg = jpegOnly || (drive.kind == DriveKind.SINGLE && saveFormat == SaveFormat.BOTH)
+        val location = if (useLocation) lastLocation else null
 
         val requests = try {
             drive.evs.mapIndexed { i, ev ->
-                val name = when (drive.kind) {
-                    DriveKind.SINGLE -> "RAW_$stamp.dng"
-                    DriveKind.BURST -> String.format(Locale.US, "RAW_%s_b%02d.dng", stamp, i + 1)
-                    DriveKind.BRACKET -> String.format(Locale.US, "RAW_%s_ev%+.1f.dng", stamp, ev)
+                val base = when (drive.kind) {
+                    DriveKind.SINGLE -> stamp
+                    DriveKind.BURST -> String.format(Locale.US, "%s_b%02d", stamp, i + 1)
+                    DriveKind.BRACKET -> String.format(Locale.US, "%s_ev%+.1f", stamp, ev)
                 }
-                val e = if (ev == 0.0) base else shifted(base, ev)
-                stillRequest(e, Frame(name, drive.kind == DriveKind.SINGLE))
+                val e = if (ev == 0.0) baseExp else shifted(baseExp, ev)
+                stillRequest(e, Frame(base, !jpegOnly, withJpeg, location))
             }
         } catch (e: Exception) {
             toast("Captura: ${e.message}")
@@ -1011,14 +1132,28 @@ class MainActivity : Activity() {
         tryPair(image.timestamp)
     }
 
+    private fun onJpeg(image: Image) {
+        if (!busy) {
+            image.close()
+            return
+        }
+        pendingJpegs[image.timestamp] = image
+        tryPair(image.timestamp)
+    }
+
+    /** A frame is saved once its metadata and every output it requested (RAW and/or JPEG) have arrived. */
     private fun tryPair(ts: Long) {
-        val image = pendingImages[ts] ?: return
         val result = pendingResults[ts] ?: return
-        pendingImages.remove(ts)
+        val frame = result.request.tag as? Frame ?: return
+        val raw = if (frame.withRaw) (pendingImages[ts] ?: return) else null
+        val jpeg = if (frame.withJpeg) (pendingJpegs[ts] ?: return) else null
         pendingResults.remove(ts)
-        val frame = result.request.tag as? Frame ?: Frame("RAW_${stamp}_$ts.dng", false)
+        pendingImages.remove(ts)
+        pendingJpegs.remove(ts)
         io.execute {
-            val ok = saveDng(image, result, frame)
+            var ok = true
+            if (raw != null) ok = saveDng(raw, result, frame)
+            if (jpeg != null) ok = saveJpeg(jpeg, "IMG_${frame.base}.jpg") && ok
             handler.post {
                 if (!busy) return@post
                 inFlight--
@@ -1040,12 +1175,14 @@ class MainActivity : Activity() {
         busy = false
         pendingImages.values.forEach { it.close() }
         pendingImages.clear()
+        pendingJpegs.values.forEach { it.close() }
+        pendingJpegs.clear()
         pendingResults.clear()
         queue.clear()
         val saved = total - failed
         toast(
             when {
-                total == 1 && failed == 0 -> "Guardado RAW_$stamp.dng"
+                total == 1 && failed == 0 -> "Guardado en DCIM/RawCam"
                 total == 1 -> "Falló la captura"
                 else -> "Guardadas $saved/$total en DCIM/RawCam"
             }
@@ -1068,11 +1205,12 @@ class MainActivity : Activity() {
 
     private fun saveDng(image: Image, result: TotalCaptureResult, frame: Frame): Boolean {
         return try {
-            val uri = insertImage(frame.name, "image/x-adobe-dng")
+            val uri = insertImage("RAW_${frame.base}.dng", "image/x-adobe-dng")
             contentResolver.openOutputStream(uri)!!.use { out ->
                 val (dngChars, dngResult) = dngSource(result)
                 DngCreator(dngChars, dngResult).use { dng ->
                     dng.setOrientation(exifOrientation())
+                    frame.location?.let { dng.setLocation(it) }
                     dng.writeImage(out, image)
                 }
             }
@@ -1104,15 +1242,17 @@ class MainActivity : Activity() {
         return manager.getCameraCharacteristics(physId) to physResult
     }
 
-    private fun saveJpeg(image: Image, name: String) {
-        try {
+    private fun saveJpeg(image: Image, name: String): Boolean {
+        return try {
             val buffer = image.planes[0].buffer
             val bytes = ByteArray(buffer.remaining()).also { buffer.get(it) }
             val uri = insertImage(name, "image/jpeg")
             contentResolver.openOutputStream(uri)!!.use { it.write(bytes) }
             publish(uri)
+            true
         } catch (e: Exception) {
             toast("JPEG: ${e.message}")
+            false
         } finally {
             image.close()
         }
@@ -1151,6 +1291,7 @@ class MainActivity : Activity() {
         private const val PREVIEW_MAX_EXPOSURE_NS = 33_333_333L
         private const val MAX_IN_FLIGHT = 3
         private const val SHUTTER_LABEL = "Capturar"
+        private const val REQUEST_LOCATION = 2
         private const val ANALYSIS_W = 360
         private const val ANALYSIS_H = 480
         private const val ANALYSIS_INTERVAL_MS = 125L
