@@ -228,6 +228,28 @@
                     android:textSize="12sp" />
             </LinearLayout>
 
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/intervalBtn"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:textAllCaps="false"
+                    android:textSize="12sp" />
+
+                <Button
+                    android:id="@+id/shotsBtn"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:textAllCaps="false"
+                    android:textSize="12sp" />
+            </LinearLayout>
+
             <CheckBox
                 android:id="@+id/locationToggle"
                 android:layout_width="wrap_content"

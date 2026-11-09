@@ -48,6 +48,7 @@ import android.view.MotionEvent
 import android.view.Surface
 import android.view.TextureView
 import android.view.View
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.FrameLayout
@@ -55,6 +56,8 @@ import android.widget.RadioGroup
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -70,10 +73,17 @@ import kotlin.math.roundToInt
 class MainActivity : Activity() {
 
     private enum class Mode { AUTO, ISO, SHUTTER, MANUAL }
-    private enum class DriveKind { SINGLE, BURST, BRACKET }
-    private data class Drive(val label: String, val kind: DriveKind, val evs: List<Double>)
+    private enum class DriveKind { SINGLE, BURST, BRACKET, STACK }
+    private data class Drive(val label: String, val kind: DriveKind, val evs: List<Double>, val infinity: Boolean = false)
     private data class Exposure(val iso: Int, val time: Long)
-    private data class Frame(val base: String, val withRaw: Boolean, val withJpeg: Boolean, val location: Location?)
+    private data class Frame(
+        val base: String,
+        val withRaw: Boolean,
+        val withJpeg: Boolean,
+        val location: Location?,
+        val stack: Boolean = false,
+        val infinity: Boolean = false,
+    )
 
     private enum class SaveFormat(val label: String) {
         BOTH("RAW + JPEG"),
@@ -100,8 +110,15 @@ class MainActivity : Activity() {
         Drive("Bracket ±1 ×3", DriveKind.BRACKET, listOf(-1.0, 0.0, 1.0)),
         Drive("Bracket ±2 ×3", DriveKind.BRACKET, listOf(-2.0, 0.0, 2.0)),
         Drive("Bracket ±2 ×5", DriveKind.BRACKET, listOf(-2.0, -1.0, 0.0, 1.0, 2.0)),
+        Drive("Promedio ×8", DriveKind.STACK, List(8) { 0.0 }),
+        Drive("Promedio ×16", DriveKind.STACK, List(16) { 0.0 }),
+        Drive("Promedio ×32", DriveKind.STACK, List(32) { 0.0 }),
+        Drive("Astro ×16 (∞)", DriveKind.STACK, List(16) { 0.0 }, infinity = true),
+        Drive("Astro ×32 (∞)", DriveKind.STACK, List(32) { 0.0 }, infinity = true),
     )
     private val timers = listOf(0, 2, 10)
+    private val intervals = listOf(0, 2, 5, 10, 30, 60)
+    private val shotCounts = listOf(10, 30, 100, 300)
 
     private lateinit var previewFrame: FrameLayout
     private lateinit var preview: TextureView
@@ -137,6 +154,28 @@ class MainActivity : Activity() {
     private lateinit var qualityBtn: Button
     private lateinit var processBtn: Button
     private lateinit var locationToggle: CheckBox
+    private lateinit var intervalBtn: Button
+    private lateinit var shotsBtn: Button
+
+    // Intervalometer (UI thread), with the shot number read by the camera thread for naming.
+    private var intervalIndex = 0
+    private var shotCountIndex = 0
+    private var intervalRunning = false
+    private var shotsTaken = 0
+    @Volatile private var intervalShot = 0
+    @Volatile private var intervalStamp = ""
+
+    // Stacking accumulator: io thread only.
+    private var stackSum: IntArray? = null
+    private var stackCount = 0
+    private var stackWidth = 0
+    private var stackHeight = 0
+    private var stackResult: TotalCaptureResult? = null
+    private var stackLocation: Location? = null
+
+    // Whether the running sequence is a stack: camera handler thread only.
+    private var stackSequence = false
+    private var stackBase = ""
 
     private val qualities = listOf(85, 90, 95, 100)
     private var qualityIndex = 2
@@ -264,6 +303,20 @@ class MainActivity : Activity() {
         qualityBtn = findViewById(R.id.qualityBtn)
         processBtn = findViewById(R.id.processBtn)
         locationToggle = findViewById(R.id.locationToggle)
+        intervalBtn = findViewById(R.id.intervalBtn)
+        shotsBtn = findViewById(R.id.shotsBtn)
+
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        intervalBtn.setOnClickListener {
+            if (intervalRunning) return@setOnClickListener
+            intervalIndex = (intervalIndex + 1) % intervals.size
+            updateButtons()
+        }
+        shotsBtn.setOnClickListener {
+            if (intervalRunning) return@setOnClickListener
+            shotCountIndex = (shotCountIndex + 1) % shotCounts.size
+            updateButtons()
+        }
 
         formatBtn.setOnClickListener {
             saveFormat = SaveFormat.values()[(saveFormat.ordinal + 1) % SaveFormat.values().size]
@@ -423,6 +476,7 @@ class MainActivity : Activity() {
     }
 
     override fun onPause() {
+        stopInterval()
         stopLocation()
         sensors.unregisterListener(levelListener)
         ui.removeCallbacks(grabTick)
@@ -548,7 +602,7 @@ class MainActivity : Activity() {
         activeArray = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)!!
         maxAfRegions = chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0
         maxAeRegions = chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
-        maxExposure = min(expRange.upper, 1_000_000_000L)
+        maxExposure = min(expRange.upper, MAX_EXPOSURE_NS)
         sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
     }
 
@@ -603,6 +657,10 @@ class MainActivity : Activity() {
         qualityBtn.isEnabled = saveFormat != SaveFormat.RAW
         processBtn.text = if (naturalJpeg) "JPEG natural" else "JPEG estándar"
         processBtn.isEnabled = saveFormat != SaveFormat.RAW
+        val interval = intervals[intervalIndex]
+        intervalBtn.text = if (interval == 0) "Intervalo: no" else "Intervalo: ${interval}s"
+        shotsBtn.text = "Tomas: ${shotCounts[shotCountIndex]}"
+        shotsBtn.isEnabled = interval > 0
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -670,11 +728,19 @@ class MainActivity : Activity() {
     }
 
     private fun onShutter() {
+        if (intervalRunning) {
+            stopInterval()
+            return
+        }
         if (counting) {
             cancelCountdown()
             return
         }
         if (busy) return
+        if (intervals[intervalIndex] > 0) {
+            startInterval()
+            return
+        }
         val secs = timers[timerIndex]
         if (secs == 0) {
             handler.post { startSequence() }
@@ -697,6 +763,53 @@ class MainActivity : Activity() {
             countdownText.text = countdownLeft.toString()
             countdownLeft--
             ui.postDelayed(this, 1000)
+        }
+    }
+
+    /** Fires one capture (with the current drive mode) every interval; a tick is skipped while a capture is running. */
+    private fun startInterval() {
+        intervalRunning = true
+        shotsTaken = 0
+        intervalStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        ui.post(intervalTick)
+        updateShutterIdle()
+    }
+
+    private val intervalTick = object : Runnable {
+        override fun run() {
+            if (!intervalRunning) return
+            if (shotsTaken >= shotCounts[shotCountIndex]) {
+                stopInterval()
+                toast("Intervalómetro terminado: $shotsTaken tomas")
+                return
+            }
+            if (!busy) {
+                shotsTaken++
+                val shot = shotsTaken
+                handler.post {
+                    intervalShot = shot
+                    startSequence()
+                }
+                updateShutterIdle()
+            }
+            ui.postDelayed(this, intervals[intervalIndex] * 1000L)
+        }
+    }
+
+    private fun stopInterval() {
+        ui.removeCallbacks(intervalTick)
+        intervalRunning = false
+        handler.post { intervalShot = 0 }
+        updateShutterIdle()
+    }
+
+    private fun updateShutterIdle() {
+        if (intervalRunning) {
+            shutter.isEnabled = true
+            shutter.text = "Detener intervalo ($shotsTaken/${shotCounts[shotCountIndex]})"
+        } else if (!busy) {
+            shutter.isEnabled = true
+            shutter.text = SHUTTER_LABEL
         }
     }
 
@@ -1024,6 +1137,10 @@ class MainActivity : Activity() {
             if (frame.withJpeg) addTarget(jpegReader!!.surface)
             set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
             applyCommon()
+            if (frame.infinity) {
+                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+                set(CaptureRequest.LENS_FOCUS_DISTANCE, 0f)
+            }
             set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
             set(CaptureRequest.SENSOR_SENSITIVITY, e.iso)
             set(CaptureRequest.SENSOR_EXPOSURE_TIME, e.time)
@@ -1053,10 +1170,15 @@ class MainActivity : Activity() {
         if (busy || session == null || device == null) return
         val drive = drives[driveIndex]
         val baseExp = baseExposure()
-        stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        stamp = if (intervalShot > 0) {
+            String.format(Locale.US, "%s_t%04d", intervalStamp, intervalShot)
+        } else {
+            SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        }
 
-        // Bursts and brackets stay RAW-only unless the user chose JPEG only.
-        val jpegOnly = saveFormat == SaveFormat.JPEG
+        // Stacks are always RAW; bursts and brackets stay RAW-only unless the user chose JPEG only.
+        val isStack = drive.kind == DriveKind.STACK
+        val jpegOnly = saveFormat == SaveFormat.JPEG && !isStack
         val withJpeg = jpegOnly || (drive.kind == DriveKind.SINGLE && saveFormat == SaveFormat.BOTH)
         val location = if (useLocation) lastLocation else null
 
@@ -1066,9 +1188,10 @@ class MainActivity : Activity() {
                     DriveKind.SINGLE -> stamp
                     DriveKind.BURST -> String.format(Locale.US, "%s_b%02d", stamp, i + 1)
                     DriveKind.BRACKET -> String.format(Locale.US, "%s_ev%+.1f", stamp, ev)
+                    DriveKind.STACK -> stamp
                 }
                 val e = if (ev == 0.0) baseExp else shifted(baseExp, ev)
-                stillRequest(e, Frame(base, !jpegOnly, withJpeg, location))
+                stillRequest(e, Frame(base, !jpegOnly, withJpeg, location, stack = isStack, infinity = drive.infinity))
             }
         } catch (e: Exception) {
             toast("Captura: ${e.message}")
@@ -1081,6 +1204,9 @@ class MainActivity : Activity() {
         done = 0
         failed = 0
         inFlight = 0
+        stackSequence = isStack
+        stackBase = stamp
+        if (isStack) io.execute { resetStack() }
         busy = true
         showProgress()
         issueNext()
@@ -1152,7 +1278,7 @@ class MainActivity : Activity() {
         pendingJpegs.remove(ts)
         io.execute {
             var ok = true
-            if (raw != null) ok = saveDng(raw, result, frame)
+            if (raw != null) ok = if (frame.stack) accumulate(raw, result, frame) else saveDng(raw, result, frame)
             if (jpeg != null) ok = saveJpeg(jpeg, "IMG_${frame.base}.jpg") && ok
             handler.post {
                 if (!busy) return@post
@@ -1180,24 +1306,109 @@ class MainActivity : Activity() {
         pendingResults.clear()
         queue.clear()
         val saved = total - failed
-        toast(
-            when {
-                total == 1 && failed == 0 -> "Guardado en DCIM/RawCam"
-                total == 1 -> "Falló la captura"
-                else -> "Guardadas $saved/$total en DCIM/RawCam"
+        when {
+            stackSequence -> {
+                toast("Promediando $saved cuadros…")
+                val base = stackBase
+                io.execute { writeStack(base) }
             }
-        )
-        runOnUiThread {
-            shutter.isEnabled = true
-            shutter.text = SHUTTER_LABEL
+            intervalShot > 0 -> Unit
+            total == 1 && failed == 0 -> toast("Guardado en DCIM/RawCam")
+            total == 1 -> toast("Falló la captura")
+            else -> toast("Guardadas $saved/$total en DCIM/RawCam")
         }
+        stackSequence = false
+        runOnUiThread { updateShutterIdle() }
     }
 
     private fun showProgress() {
         val text = if (total > 1) "Capturando ${done + 1}/$total…" else "Capturando…"
         runOnUiThread {
-            shutter.isEnabled = false
-            shutter.text = text
+            if (intervalRunning) {
+                shutter.isEnabled = true
+                shutter.text = "Detener intervalo ($shotsTaken/${shotCounts[shotCountIndex]}) · $text"
+            } else {
+                shutter.isEnabled = false
+                shutter.text = text
+            }
+        }
+    }
+
+    // ---- Stacking (io thread) ----
+
+    private fun resetStack() {
+        stackSum = null
+        stackCount = 0
+        stackResult = null
+        stackLocation = null
+    }
+
+    /** Adds one RAW_SENSOR frame (16-bit little-endian, possibly row-padded) to the running sum. */
+    private fun accumulate(image: Image, result: TotalCaptureResult, frame: Frame): Boolean {
+        return try {
+            val w = image.width
+            val h = image.height
+            var sum = stackSum
+            if (sum == null || w != stackWidth || h != stackHeight) {
+                sum = IntArray(w * h)
+                stackSum = sum
+                stackWidth = w
+                stackHeight = h
+                stackCount = 0
+                stackResult = result
+                stackLocation = frame.location
+            }
+            val plane = image.planes[0]
+            val shorts = plane.buffer.order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+            val rowShorts = plane.rowStride / 2
+            val row = ShortArray(w)
+            for (y in 0 until h) {
+                shorts.position(y * rowShorts)
+                shorts.get(row, 0, w)
+                val offset = y * w
+                for (x in 0 until w) sum[offset + x] += row[x].toInt() and 0xFFFF
+            }
+            stackCount++
+            true
+        } catch (e: Exception) {
+            toast("Stack: ${e.message}")
+            false
+        } finally {
+            image.close()
+        }
+    }
+
+    /** Writes the averaged frame as a DNG using the first frame's metadata. */
+    private fun writeStack(base: String) {
+        val sum = stackSum
+        val result = stackResult
+        val n = stackCount
+        if (sum == null || result == null || n == 0) {
+            toast("No hay cuadros para promediar")
+            return
+        }
+        try {
+            val pixels = ByteBuffer.allocateDirect(sum.size * 2).order(ByteOrder.LITTLE_ENDIAN)
+            val shorts = pixels.asShortBuffer()
+            for (i in sum.indices) shorts.put(i, ((sum[i] + n / 2) / n).toShort())
+            pixels.rewind()
+
+            val name = "RAW_${base}_avg$n.dng"
+            val uri = insertImage(name, "image/x-adobe-dng")
+            contentResolver.openOutputStream(uri)!!.use { out ->
+                val (dngChars, dngResult) = dngSource(result)
+                DngCreator(dngChars, dngResult).use { dng ->
+                    dng.setOrientation(exifOrientation())
+                    stackLocation?.let { dng.setLocation(it) }
+                    dng.writeByteBuffer(out, Size(stackWidth, stackHeight), pixels, 0)
+                }
+            }
+            publish(uri)
+            toast("Guardado $name")
+        } catch (e: Exception) {
+            toast("Stack DNG: ${e.message}")
+        } finally {
+            resetStack()
         }
     }
 
@@ -1292,6 +1503,7 @@ class MainActivity : Activity() {
         private const val MAX_IN_FLIGHT = 3
         private const val SHUTTER_LABEL = "Capturar"
         private const val REQUEST_LOCATION = 2
+        private const val MAX_EXPOSURE_NS = 30_000_000_000L
         private const val ANALYSIS_W = 360
         private const val ANALYSIS_H = 480
         private const val ANALYSIS_INTERVAL_MS = 125L
