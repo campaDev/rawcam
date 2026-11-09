@@ -70,6 +70,10 @@ import com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions
 import com.google.mlkit.vision.documentscanner.GmsDocumentScanning
 import com.google.mlkit.vision.documentscanner.GmsDocumentScanningResult
 import com.google.mlkit.vision.face.FaceDetection
+import com.google.mlkit.vision.label.ImageLabeling
+import com.google.mlkit.vision.label.defaults.ImageLabelerOptions
+import com.google.mlkit.vision.objects.ObjectDetection
+import com.google.mlkit.vision.objects.defaults.ObjectDetectorOptions
 import com.google.mlkit.vision.face.FaceDetectorOptions
 import com.google.mlkit.vision.pose.Pose
 import com.google.mlkit.vision.pose.PoseDetection
@@ -106,6 +110,7 @@ class MainActivity : Activity() {
         val scored: Boolean = false,
         val saveJpeg: Boolean = withJpeg,
         val folder: String = DEFAULT_FOLDER,
+        val tags: String? = null,
     )
 
     private class ScoredShot(val base: String, val uris: MutableList<Uri>, val score: Float, val faces: Int, val eyesOpen: Int)
@@ -223,6 +228,34 @@ class MainActivity : Activity() {
     // Camera handler thread only.
     private var burstSequence = false
     @Volatile private var bestOnly = false
+
+    private lateinit var productToggle: CheckBox
+    private lateinit var personFrameToggle: CheckBox
+    private lateinit var autoFolderToggle: CheckBox
+    private lateinit var framingHint: TextView
+
+    // Object tracking for product framing (UI thread); the region 3A follows is read by the camera thread.
+    private val objectDetector by lazy {
+        ObjectDetection.getClient(
+            ObjectDetectorOptions.Builder().setDetectorMode(ObjectDetectorOptions.STREAM_MODE).build()
+        )
+    }
+    private var objectBusy = false
+    private var lastObjectAt = 0L
+    private var lastObjectRefresh = 0L
+    @Volatile private var objectRegion: MeteringRectangle? = null
+    private var productHint: String? = null
+    private var personHint: String? = null
+    @Volatile private var faceRectsView: List<android.graphics.RectF> = emptyList()
+
+    // Scene labels (ML Kit Image Labeling), refreshed about once per second.
+    private val labeler by lazy {
+        ImageLabeling.getClient(ImageLabelerOptions.Builder().setConfidenceThreshold(LABEL_MIN_CONFIDENCE).build())
+    }
+    private var labelBusy = false
+    private var lastLabelAt = 0L
+    @Volatile private var sceneLabels: List<String> = emptyList()
+    @Volatile private var autoFolders = false
 
     private lateinit var skuField: EditText
     private lateinit var barcodeBtn: Button
@@ -446,6 +479,29 @@ class MainActivity : Activity() {
         locationToggle = findViewById(R.id.locationToggle)
         intervalBtn = findViewById(R.id.intervalBtn)
         shotsBtn = findViewById(R.id.shotsBtn)
+        productToggle = findViewById(R.id.productToggle)
+        personFrameToggle = findViewById(R.id.personFrameToggle)
+        autoFolderToggle = findViewById(R.id.autoFolderToggle)
+        framingHint = findViewById(R.id.framingHint)
+        productToggle.setOnCheckedChangeListener { _, checked ->
+            if (!checked) {
+                overlay.setObjectBox(null, false)
+                productHint = null
+                updateFramingHint()
+                handler.post {
+                    objectRegion = null
+                    refreshPreview()
+                }
+            }
+        }
+        personFrameToggle.setOnCheckedChangeListener { _, checked ->
+            if (!checked) {
+                personHint = null
+                updateFramingHint()
+            }
+        }
+        autoFolderToggle.setOnCheckedChangeListener { _, checked -> autoFolders = checked }
+
         skuField = findViewById(R.id.skuField)
         barcodeBtn = findViewById(R.id.barcodeBtn)
         docBtn = findViewById(R.id.docBtn)
@@ -473,13 +529,7 @@ class MainActivity : Activity() {
 
         guideBtn = findViewById(R.id.guideBtn)
         sessionToggle = findViewById(R.id.sessionToggle)
-        guideBtn.setOnClickListener {
-            guideIndex = (guideIndex + 1) % guides.size
-            val guide = guides[guideIndex]
-            overlay.guideAspect = guide.aspect
-            overlay.guideSafeZones = guide.safeZones
-            updateButtons()
-        }
+        guideBtn.setOnClickListener { setGuide((guideIndex + 1) % guides.size) }
         sessionToggle.setOnCheckedChangeListener { _, checked -> if (checked) startSession() else endSession() }
 
         ettrToggle = findViewById(R.id.ettrToggle)
@@ -1241,6 +1291,200 @@ class MainActivity : Activity() {
         updateShutterIdle()
     }
 
+    private fun setGuide(index: Int) {
+        guideIndex = index
+        val guide = guides[guideIndex]
+        overlay.guideAspect = guide.aspect
+        overlay.guideSafeZones = guide.safeZones
+        updateButtons()
+    }
+
+    /** Active guide in normalised preview coordinates (the whole frame when no guide is set). */
+    private fun guideRect(): android.graphics.RectF {
+        val aspect = guides[guideIndex].aspect
+        if (aspect <= 0f || preview.width == 0) return android.graphics.RectF(0f, 0f, 1f, 1f)
+        val viewAspect = preview.width.toFloat() / preview.height
+        return if (aspect > viewAspect) {
+            val h = viewAspect / aspect
+            android.graphics.RectF(0f, (1f - h) / 2, 1f, (1f + h) / 2)
+        } else {
+            val w = aspect / viewAspect
+            android.graphics.RectF((1f - w) / 2, 0f, (1f + w) / 2, 1f)
+        }
+    }
+
+    private fun updateFramingHint() {
+        val text = productHint ?: personHint
+        if (text == null) {
+            framingHint.visibility = View.GONE
+            return
+        }
+        framingHint.text = text
+        framingHint.setBackgroundColor(if (text.startsWith("✓")) 0xE62E7D32.toInt() else 0xE6EF6C00.toInt())
+        framingHint.visibility = View.VISIBLE
+    }
+
+    // ---- Product framing (ML Kit Object Detection) ----
+
+    private fun maybeDetectObject() {
+        if (!productToggle.isChecked || objectBusy) return
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - lastObjectAt < OBJECT_INTERVAL_MS) return
+        lastObjectAt = now
+        objectBusy = true
+        val copy = grabBitmap.copy(Bitmap.Config.ARGB_8888, false)
+        val w = copy.width.toFloat()
+        val h = copy.height.toFloat()
+        objectDetector.process(InputImage.fromBitmap(copy, 0))
+            .addOnSuccessListener { objects ->
+                val main = objects.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }
+                onProductBox(main?.boundingBox?.let { android.graphics.RectF(it.left / w, it.top / h, it.right / w, it.bottom / h) })
+            }
+            .addOnCompleteListener {
+                objectBusy = false
+                copy.recycle()
+            }
+    }
+
+    /**
+     * Checks the main object against the active guide's 5% safety margin, its centring and how
+     * much of the frame it fills; also hands its region to AF/AE (unless a session is locked).
+     */
+    private fun onProductBox(box: android.graphics.RectF?) {
+        if (!productToggle.isChecked) return
+        if (box == null) {
+            overlay.setObjectBox(null, false)
+            productHint = "Buscando el producto…"
+            updateFramingHint()
+            return
+        }
+        val guide = guideRect()
+        val m = min(guide.width(), guide.height()) * 0.05f
+        val safe = android.graphics.RectF(guide.left + m, guide.top + m, guide.right - m, guide.bottom - m)
+        val dx = box.centerX() - guide.centerX()
+        val dy = box.centerY() - guide.centerY()
+        val fill = (box.width() * box.height()) / (guide.width() * guide.height())
+        val hint = when {
+            box.left < safe.left -> "El producto se sale por la izquierda"
+            box.right > safe.right -> "El producto se sale por la derecha"
+            box.top < safe.top -> "El producto se sale por arriba"
+            box.bottom > safe.bottom -> "El producto se sale por abajo"
+            fill < PRODUCT_MIN_FILL -> "Acercate: el producto ocupa poco del encuadre"
+            abs(dx) > PRODUCT_CENTER_TOL -> if (dx > 0) "Centrá: mové el producto ←" else "Centrá: mové el producto →"
+            abs(dy) > PRODUCT_CENTER_TOL -> if (dy > 0) "Centrá: mové el producto ↑" else "Centrá: mové el producto ↓"
+            else -> null
+        }
+        overlay.setObjectBox(box, hint == null)
+        productHint = hint ?: "✓ Producto bien encuadrado"
+        updateFramingHint()
+
+        if (sessionLocked) return
+        val next = MeteringRectangle(viewToSensor(box), MeteringRectangle.METERING_WEIGHT_MAX - 1)
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - lastObjectRefresh > OBJECT_REFRESH_MS && regionMoved(objectRegion, next)) {
+            lastObjectRefresh = now
+            handler.post {
+                objectRegion = next
+                if (focusRegion == null && !manualFocus) refreshPreview()
+            }
+        }
+    }
+
+    /** Normalised portrait-preview rectangle → active-array rectangle (forward of [toViewRect]). */
+    private fun viewToSensor(r: android.graphics.RectF): Rect {
+        fun map(nx: Float, ny: Float): Pair<Float, Float> = when (sensorOrientation) {
+            90 -> ny to 1f - nx
+            180 -> 1f - nx to 1f - ny
+            270 -> 1f - ny to nx
+            else -> nx to ny
+        }
+        val (ax, ay) = map(r.left, r.top)
+        val (bx, by) = map(r.right, r.bottom)
+        val w = activeArray.width()
+        val h = activeArray.height()
+        return clampToActive(
+            Rect((min(ax, bx) * w).toInt(), (min(ay, by) * h).toInt(), (maxOf(ax, bx) * w).toInt(), (maxOf(ay, by) * h).toInt())
+        )
+    }
+
+    // ---- People framing (Pose + faces) ----
+
+    /** Classic framing mistakes: cut-off head, cuts at the knees or feet, people touching the edge. */
+    private fun evaluatePersonFrame(pose: Pose) {
+        val w = ANALYSIS_W.toFloat()
+        val h = ANALYSIS_H.toFloat()
+        fun seen(type: Int) = pose.getPoseLandmark(type)?.takeIf { it.inFrameLikelihood > 0.5f }
+        fun likelihood(type: Int) = pose.getPoseLandmark(type)?.inFrameLikelihood ?: 0f
+
+        val nose = seen(PoseLandmark.NOSE)
+        val shoulders = listOfNotNull(seen(PoseLandmark.LEFT_SHOULDER), seen(PoseLandmark.RIGHT_SHOULDER))
+        val hips = listOfNotNull(seen(PoseLandmark.LEFT_HIP), seen(PoseLandmark.RIGHT_HIP))
+        val knees = listOfNotNull(seen(PoseLandmark.LEFT_KNEE), seen(PoseLandmark.RIGHT_KNEE))
+        val ankles = listOfNotNull(seen(PoseLandmark.LEFT_ANKLE), seen(PoseLandmark.RIGHT_ANKLE))
+        val anklesOut = likelihood(PoseLandmark.LEFT_ANKLE) < 0.3f && likelihood(PoseLandmark.RIGHT_ANKLE) < 0.3f
+
+        val faceAtEdge = faceRectsView.any { it.left < 0.02f || it.right > 0.98f || it.top < 0.02f }
+        val hint = when {
+            nose != null && shoulders.isNotEmpty() &&
+                nose.position.y - (shoulders.map { it.position.y }.average().toFloat() - nose.position.y) * 0.9f < 0f ->
+                "Se corta la cabeza: subí la cámara o alejate"
+            faceAtEdge -> "Alguien queda cortado en el borde: alejate un poco"
+            (shoulders + hips).any { it.position.x < w * 0.03f || it.position.x > w * 0.97f } ->
+                "La persona toca el borde: dejale aire al costado"
+            knees.isNotEmpty() && anklesOut && knees.maxOf { it.position.y } > h * 0.85f ->
+                "Corte en las rodillas: mostrá los pies o cortá a la cintura"
+            ankles.isNotEmpty() && ankles.maxOf { it.position.y } > h * 0.97f ->
+                "Se cortan los pies: bajá un poco la cámara"
+            else -> null
+        }
+        personHint = hint
+        updateFramingHint()
+    }
+
+    // ---- Scene labels (ML Kit Image Labeling) ----
+
+    private fun maybeLabel() {
+        if (!(sceneToggle.isChecked || autoFolderToggle.isChecked) || labelBusy) return
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - lastLabelAt < LABEL_INTERVAL_MS) return
+        lastLabelAt = now
+        labelBusy = true
+        val copy = grabBitmap.copy(Bitmap.Config.ARGB_8888, false)
+        labeler.process(InputImage.fromBitmap(copy, 0))
+            .addOnSuccessListener { labels -> sceneLabels = labels.map { it.text } }
+            .addOnCompleteListener {
+                labelBusy = false
+                copy.recycle()
+            }
+    }
+
+    private fun hasLabel(vararg names: String) =
+        sceneLabels.any { label -> names.any { label.equals(it, ignoreCase = true) } }
+
+    /** Folder for automatic sorting, from detected faces and scene labels. */
+    private fun autoCategory(): String = when {
+        faceCount > 0 -> "Personas"
+        hasLabel(*PET_LABELS) -> "Mascotas"
+        hasLabel(*FOOD_LABELS) -> "Comida"
+        hasLabel(*PRODUCT_LABELS) -> "Productos"
+        hasLabel(*LANDSCAPE_LABELS) -> "Paisajes"
+        else -> "Otros"
+    }
+
+    /** Writes the scene labels into the JPEG (ImageDescription / UserComment) so galleries can search them. */
+    private fun writeJpegTags(uri: Uri, tags: String) {
+        try {
+            contentResolver.openFileDescriptor(uri, "rw")?.use { pfd ->
+                val exif = ExifInterface(pfd.fileDescriptor)
+                exif.setAttribute(ExifInterface.TAG_IMAGE_DESCRIPTION, tags)
+                exif.setAttribute(ExifInterface.TAG_USER_COMMENT, "RawCam: $tags")
+                exif.saveAttributes()
+            }
+        } catch (e: Exception) {
+            // Tags are best-effort; the photo is already saved.
+        }
+    }
+
     // ---- Smile shutter ----
 
     private fun startSmileWait() {
@@ -1420,7 +1664,7 @@ class MainActivity : Activity() {
     private var gestureCooldownUntil = 0L
 
     private fun maybeDetectPose() {
-        if (!gestureToggle.isChecked || poseBusy) return
+        if (!(gestureToggle.isChecked || personFrameToggle.isChecked) || poseBusy) return
         val now = android.os.SystemClock.uptimeMillis()
         if (now - lastPoseAt < POSE_INTERVAL_MS) return
         lastPoseAt = now
@@ -1435,6 +1679,8 @@ class MainActivity : Activity() {
     }
 
     private fun onPose(pose: Pose) {
+        if (personFrameToggle.isChecked) evaluatePersonFrame(pose)
+        if (!gestureToggle.isChecked) return
         val now = android.os.SystemClock.uptimeMillis()
         val nose = pose.getPoseLandmark(PoseLandmark.NOSE)
         val wrists = listOf(pose.getPoseLandmark(PoseLandmark.LEFT_WRIST), pose.getPoseLandmark(PoseLandmark.RIGHT_WRIST))
@@ -1624,7 +1870,8 @@ class MainActivity : Activity() {
 
     private fun needsAnalysis() =
         histToggle.isChecked || zebraToggle.isChecked || peakToggle.isChecked || lensToggle.isChecked ||
-            ettrToggle.isChecked || sceneToggle.isChecked || astroSelected() || gestureToggle.isChecked
+            ettrToggle.isChecked || sceneToggle.isChecked || astroSelected() || gestureToggle.isChecked ||
+            productToggle.isChecked || personFrameToggle.isChecked || autoFolderToggle.isChecked
 
     private val grabTick = object : Runnable {
         override fun run() {
@@ -1632,6 +1879,8 @@ class MainActivity : Activity() {
                 preview.getBitmap(grabBitmap)
                 grabBitmap.getPixels(pixels, 0, ANALYSIS_W, 0, 0, ANALYSIS_W, ANALYSIS_H)
                 maybeDetectPose()
+                maybeDetectObject()
+                maybeLabel()
                 analyzing = true
                 val hist = histToggle.isChecked
                 val zebra = zebraToggle.isChecked
@@ -1773,6 +2022,34 @@ class MainActivity : Activity() {
                 drive("Promedio ×16", "🌆 Poca luz y apoyado → Promedio ×16")
             auto && (iso >= 1600 || time >= 66_000_000L) ->
                 drive("Ráfaga ×8", "✋ Poca luz a pulso → Ráfaga ×8 + solo la mejor") { bestToggle.isChecked = true }
+
+            // Content-aware suggestions from ML Kit labels and face count.
+            faceCount >= 3 && timers[timerIndex] != GROUP_TIMER ->
+                Suggestion("👨‍👩‍👧 Grupo → timer de grupo + ráfaga ×4 con la mejor") {
+                    timerIndex = timers.indexOf(GROUP_TIMER)
+                    driveIndex = driveNamed("Ráfaga ×4").coerceAtLeast(0)
+                    bestToggle.isChecked = true
+                    updateButtons()
+                }
+            hasLabel(*PET_LABELS) && faceCount == 0 && !kidsToggle.isChecked ->
+                Suggestion("🐾 Mascota → modo niños (1/250 s + ráfaga)") { kidsToggle.isChecked = true }
+            hasLabel(*FOOD_LABELS) && !(guides[guideIndex].aspect == 0.8f && naturalJpeg) ->
+                Suggestion("🍽️ Comida → guía 4:5 + JPEG natural") {
+                    setGuide(guides.indexOfFirst { it.aspect == 0.8f })
+                    naturalJpeg = true
+                    updateButtons()
+                }
+            hasLabel(*PRODUCT_LABELS) && !productToggle.isChecked && !sessionLocked ->
+                Suggestion("📦 Producto → guía 1:1 + centrar producto") {
+                    setGuide(guides.indexOfFirst { it.aspect == 1f })
+                    productToggle.isChecked = true
+                }
+            auto && hasLabel(*BRIGHT_LABELS) && highs < 0.02f && evIndex * evStep.toDouble() < 0.5 ->
+                Suggestion("❄️ Escena muy clara (nieve/playa) → +0.7 EV") {
+                    val steps = (0.7 / evStep.toDouble()).roundToInt()
+                    evBar.progress = (evBar.progress + steps).coerceAtMost(evBar.max)
+                }
+
             highs > 0.02f && shadows > 0.15f ->
                 drive("Bracket ±2 ×3", "☀️ Contraluz → Bracket ±2 ×3")
             subjectDiopters > 6f && !manualFocus && minFocusDiopters > 0f ->
@@ -2144,7 +2421,8 @@ class MainActivity : Activity() {
     /** Priority: manual focus > tapped point (single AF) > detected face (continuous AF) > scene. */
     private fun CaptureRequest.Builder.applyFocus() {
         val tap = focusRegion
-        val face = if (useFaces) faceRegion else null
+        // Faces take priority over the tracked product; both follow continuous AF.
+        val face = (if (useFaces) faceRegion else null) ?: objectRegion
         if (manualFocus) {
             set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
             set(CaptureRequest.LENS_FOCUS_DISTANCE, focusDiopters)
@@ -2177,6 +2455,7 @@ class MainActivity : Activity() {
         }
         if (frameCount % 3 == 0) {
             val rects = valid.map { toViewRect(it.bounds) }
+            faceRectsView = rects
             runOnUiThread { overlay.setFaces(if (faceToggle.isChecked) rects else emptyList()) }
         }
     }
@@ -2340,7 +2619,13 @@ class MainActivity : Activity() {
             intervalShot > 0 -> String.format(Locale.US, "%s_t%04d", intervalStamp, intervalShot)
             else -> SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         }
-        val folder = if (sku != null) "$DEFAULT_FOLDER/$sku" else DEFAULT_FOLDER
+        // SKU wins; otherwise automatic folders sort by content (faces + ML Kit labels).
+        val folder = when {
+            sku != null -> "$DEFAULT_FOLDER/$sku"
+            autoFolders -> "$DEFAULT_FOLDER/${autoCategory()}"
+            else -> DEFAULT_FOLDER
+        }
+        val tags = if (autoFolders) sceneLabels.take(MAX_TAGS).joinToString(", ").ifEmpty { null } else null
 
         // Stacks are always RAW; bursts and brackets stay RAW-only unless the user chose JPEG only.
         val isStack = drive.kind == DriveKind.STACK
@@ -2361,7 +2646,7 @@ class MainActivity : Activity() {
                 val scored = drive.kind == DriveKind.BURST && !jpegOnly
                 // With people in frame, bursts also capture a JPEG so blinks can be scored.
                 val jpegTarget = withJpeg || (scored && groupFaces)
-                stillRequest(e, Frame(base, !jpegOnly, jpegTarget, location, isStack, drive.infinity, scored, withJpeg, folder))
+                stillRequest(e, Frame(base, !jpegOnly, jpegTarget, location, isStack, drive.infinity, scored, withJpeg, folder, tags))
             }
         } catch (e: Exception) {
             toast("Captura: ${e.message}")
@@ -2456,8 +2741,12 @@ class MainActivity : Activity() {
             if (raw != null) ok = if (frame.stack) accumulate(raw, result, frame) else saveDng(raw, result, frame, group)
             if (jpegBytes != null && frame.saveJpeg) {
                 val uri = saveJpegBytes(jpegBytes, "IMG_${frame.base}.jpg", frame.folder)
-                if (uri == null) ok = false
-                else if (frame.scored) scoredShots.lastOrNull { it.base == frame.base }?.uris?.add(uri)
+                if (uri == null) {
+                    ok = false
+                } else {
+                    frame.tags?.let { writeJpegTags(uri, it) }
+                    if (frame.scored) scoredShots.lastOrNull { it.base == frame.base }?.uris?.add(uri)
+                }
             }
             handler.post {
                 if (!busy) return@post
@@ -2807,6 +3096,29 @@ class MainActivity : Activity() {
         private const val GLOW_LIMIT = 0.50f
 
         private const val DEFAULT_FOLDER = "DCIM/RawCam"
+        private const val OBJECT_INTERVAL_MS = 250L
+        private const val OBJECT_REFRESH_MS = 500L
+        private const val PRODUCT_MIN_FILL = 0.25f
+        private const val PRODUCT_CENTER_TOL = 0.08f
+        private const val LABEL_INTERVAL_MS = 1000L
+        private const val LABEL_MIN_CONFIDENCE = 0.65f
+        private const val MAX_TAGS = 5
+
+        // ML Kit base-model labels (English) grouped by use.
+        private val PET_LABELS = arrayOf("Dog", "Cat", "Pet", "Bird")
+        private val FOOD_LABELS = arrayOf(
+            "Food", "Dish", "Cuisine", "Fast food", "Dessert", "Baked goods", "Bread", "Pizza", "Cake",
+            "Meal", "Fruit", "Vegetable", "Cookie", "Sushi",
+        )
+        private val PRODUCT_LABELS = arrayOf(
+            "Mobile phone", "Gadget", "Computer", "Laptop", "Television", "Monitor", "Camera",
+            "Headphones", "Keyboard", "Watch", "Electronic device", "Smartphone", "Tablet computer",
+        )
+        private val LANDSCAPE_LABELS = arrayOf(
+            "Sky", "Cloud", "Mountain", "Beach", "Sea", "Lake", "River", "Tree", "Field", "Sunset",
+            "Grass", "Waterfall", "Forest", "Desert",
+        )
+        private val BRIGHT_LABELS = arrayOf("Snow", "Beach")
         private const val REQUEST_DOCUMENT = 3
         private const val DOC_PAGE_LIMIT = 20
         private const val SMILE_MAX_WAIT_MS = 20_000L

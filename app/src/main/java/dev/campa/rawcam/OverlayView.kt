@@ -40,6 +40,8 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
     private var mask: Bitmap? = null
     private var levelDeg = 0f
     private var faces: List<RectF> = emptyList()
+    private var objectBox: RectF? = null
+    private var objectOk = false
 
     private val density = resources.displayMetrics.density
     private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -55,6 +57,10 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
         style = Paint.Style.STROKE
         strokeWidth = 2f * density
         color = 0xFF4FC3F7.toInt()
+    }
+    private val objectPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2.5f * density
     }
     private val shadePaint = Paint().apply { color = 0x99000000.toInt() }
     private val guidePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -77,6 +83,14 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
         invalidate()
     }
 
+    /** Main detected object (normalised 0–1); green when well framed, orange otherwise. */
+    fun setObjectBox(box: RectF?, ok: Boolean) {
+        if (box == null && objectBox == null) return
+        objectBox = box
+        objectOk = ok
+        invalidate()
+    }
+
     /** Face rectangles in normalised (0–1) preview coordinates. */
     fun setFaces(rects: List<RectF>) {
         if (rects.isEmpty() && faces.isEmpty()) return
@@ -95,6 +109,10 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
             canvas.drawBitmap(it, null, dst, maskPaint)
         }
         drawGuide(canvas)
+        objectBox?.let { b ->
+            objectPaint.color = if (objectOk) 0xFF4CFF4C.toInt() else 0xFFFF9800.toInt()
+            canvas.drawRect(b.left * width, b.top * height, b.right * width, b.bottom * height, objectPaint)
+        }
         for (f in faces) {
             canvas.drawRect(f.left * width, f.top * height, f.right * width, f.bottom * height, facePaint)
         }

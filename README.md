@@ -44,8 +44,12 @@ El APK se compila en GitHub Actions (`build-apk`) en cada push. Se descarga desd
 - ✅ Histograma en vivo, zebras, focus peaking, grilla de tercios y nivel.
 - ✅ **Obturación segura sugerida** según el pulso (giroscopio).
 - ✅ **Detector de lente sucio** (heurístico; umbrales por calibrar).
-- ✅ **Sugerencias por escena** (poca luz, contraluz, primer plano, muy oscuro).
+- ✅ **Sugerencias por escena**: por luz (poca luz, contraluz, muy oscuro, primer plano) y por
+  contenido con ML Kit Image Labeling (grupo, mascota, comida, producto, nieve/playa).
 - ✅ **Guías de encuadre** 1:1, 4:5 y 9:16 con zonas seguras de TikTok/Reels/Estados.
+- ✅ **Centrar producto** (ML Kit Object Detection): recuadro, avisos de encuadre y AF/AE sobre el
+  producto.
+- ✅ **Encuadre de personas** (Pose + caras): cabeza o pies cortados, cortes en rodillas, bordes.
 
 ### Presets
 - ✅ **Sesión de producto**: bloquea exposición, balance y foco para todo un lote.
@@ -54,6 +58,8 @@ El APK se compila en GitHub Actions (`build-apk`) en cada push. Se descarga desd
 ### Guardado
 - ✅ **SKU** (a mano o leyendo el código de barras): carpeta `DCIM/RawCam/<SKU>/` y numeración por
   producto.
+- ✅ **Carpetas automáticas** por contenido (Personas, Mascotas, Comida, Productos, Paisajes,
+  Otros) y etiquetas en el JPEG.
 - ✅ **Escáner de documentos** a PDF en `Documents/RawCam/` (ML Kit Document Scanner).
 - ✅ Formato RAW + JPEG / Solo RAW / Solo JPEG; calidad JPEG 85–100%; JPEG "natural" (sin
   nitidez, ruido mínimo).
@@ -66,8 +72,7 @@ El APK se compila en GitHub Actions (`build-apk`) en cada push. Se descarga desd
 - [Fotos de productos](docs/fotos-productos.md): exportación para redes, fondo blanco automático,
   360°, apilado de foco.
 - [Fotos de familia](docs/fotos-familia.md): retrato con fondo desenfocado.
-- [Mejoras con ML Kit](docs/ml-kit.md): leer etiquetas, producto centrado, mascotas, escenas por
-  contenido, etiquetas automáticas.
+- [Mejoras con ML Kit](docs/ml-kit.md): leer texto de etiquetas, seguimiento de mascotas.
 - Calibrar los umbrales del detector de lente sucio con datos reales.
 - Recordar los ajustes al cerrar la app.
 

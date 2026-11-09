@@ -83,6 +83,19 @@
             android:visibility="gone" />
 
         <TextView
+            android:id="@+id/framingHint"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="top|center_horizontal"
+            android:layout_marginTop="128dp"
+            android:background="#E6EF6C00"
+            android:paddingHorizontal="10dp"
+            android:paddingVertical="6dp"
+            android:textColor="#FFFFFF"
+            android:textSize="13sp"
+            android:visibility="gone" />
+
+        <TextView
             android:id="@+id/astroBadge"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
@@ -476,6 +489,39 @@
                     android:layout_weight="1.2"
                     android:checked="true"
                     android:text="Sugerencias"
+                    android:textColor="#FFFFFF"
+                    android:textSize="12sp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <CheckBox
+                    android:id="@+id/productToggle"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Centrar producto"
+                    android:textColor="#FFFFFF"
+                    android:textSize="12sp" />
+
+                <CheckBox
+                    android:id="@+id/personFrameToggle"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1.1"
+                    android:text="Encuadre personas"
+                    android:textColor="#FFFFFF"
+                    android:textSize="12sp" />
+
+                <CheckBox
+                    android:id="@+id/autoFolderToggle"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Carpetas auto"
                     android:textColor="#FFFFFF"
                     android:textSize="12sp" />
             </LinearLayout>

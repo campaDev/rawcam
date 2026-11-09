@@ -4,9 +4,10 @@ Ideas para aprovechar ML Kit (Google), que procesa en el teléfono sin enviar im
 Ya integrados: **Face Detection** (mejor toma de grupo) y **Pose Detection** (disparo con gesto).
 
 Estado:
-- ✅ Implementado: **1** SKU por código de barras (+ carpetas por SKU), **6** disparo con sonrisa,
-  **5** escáner de documentos.
-- ⏳ Pendiente: el resto.
+- ✅ Implementado: **1** SKU por código de barras (+ carpetas por SKU), **4** producto centrado,
+  **5** escáner de documentos, **6** disparo con sonrisa, **8** encuadre de personas,
+  **10** sugerencias por contenido, **11** carpetas y etiquetas automáticas.
+- ⏳ Pendiente: **2** leer etiquetas, **3** fondo blanco, **7** retrato, **9** mascotas.
 
 ## Resumen
 
@@ -15,14 +16,14 @@ Estado:
 | 1 | SKU desde el código de barras | Code Scanner (Barcode) | TechNTere | Baja | ✅ Hecho |
 | 2 | Leer modelo y specs de la etiqueta | Text Recognition v2 | TechNTere | Media | ⏳ Pendiente |
 | 3 | Fondo blanco automático | Subject Segmentation | TechNTere | Media | ⏳ Pendiente |
-| 4 | Producto siempre centrado | Object Detection & Tracking | TechNTere | Media | ⏳ Pendiente |
+| 4 | Producto siempre centrado | Object Detection & Tracking | TechNTere | Media | ✅ Hecho |
 | 5 | Escáner de documentos | Document Scanner | TechNTere | Baja | ✅ Hecho |
 | 6 | Disparo con sonrisa | Face Detection | Familia | Baja | ✅ Hecho |
 | 7 | Retrato con fondo desenfocado | Selfie Segmentation | Familia | Media | ⏳ Pendiente |
-| 8 | Asistente de encuadre de personas | Pose Detection | Familia | Media | ⏳ Pendiente |
+| 8 | Asistente de encuadre de personas | Pose Detection | Familia | Media | ✅ Hecho |
 | 9 | Seguimiento de mascotas | Object Detection + Image Labeling | Familia | Media | ⏳ Pendiente |
-| 10 | Sugerencias de escena por contenido | Image Labeling | Toda la app | Media | ⏳ Pendiente |
-| 11 | Etiquetas y carpetas automáticas | Image Labeling | Toda la app | Baja | ⏳ Pendiente |
+| 10 | Sugerencias de escena por contenido | Image Labeling | Toda la app | Media | ✅ Hecho |
+| 11 | Etiquetas y carpetas automáticas | Image Labeling | Toda la app | Baja | ✅ Hecho |
 
 ## 1. SKU desde el código de barras ✅
 - Botón "Código" → abre el **Google Code Scanner** (interfaz de Play services, sin permisos
@@ -43,10 +44,13 @@ Estado:
 ## 3. Fondo blanco automático
 Ver `fotos-productos.md` §6: **Subject Segmentation** → JPEG sobre blanco o PNG transparente.
 
-## 4. Producto siempre centrado
-- **Object Detection & Tracking** en modo stream: caja del objeto principal.
-- Aviso si se sale de la guía (1:1 / 4:5 / 9:16) o queda corrido; opcionalmente, AF/AE que lo
-  siguen, como con las caras.
+## 4. Producto siempre centrado ✅
+- Casilla "Centrar producto". **Object Detection** en modo stream (~4 veces por segundo) sobre
+  la vista previa: recuadro del objeto principal, verde si está bien y naranja si no.
+- Avisos, en orden: se sale por un lado de la guía (con el margen del 5%), ocupa menos del 25%
+  del encuadre ("Acercate"), o está corrido más de un 8% del centro (flecha hacia dónde moverlo).
+- El AF/AE sigue al producto (las caras tienen prioridad; un toque o la sesión bloqueada lo anulan).
+- Dependencia: `com.google.mlkit:object-detection`.
 
 ## 5. Escáner de documentos ✅
 - Botón "Documento" → **ML Kit Document Scanner** (interfaz de Google: detección de bordes,
@@ -67,21 +71,35 @@ Ver `fotos-productos.md` §6: **Subject Segmentation** → JPEG sobre blanco o P
 ## 7. Retrato con fondo desenfocado
 Ver `fotos-familia.md` §5: **Selfie Segmentation** + desenfoque del fondo en un JPEG aparte.
 
-## 8. Asistente de encuadre de personas
-- Con los puntos de **Pose Detection**: avisa si se cortan cabezas o pies, o si alguien queda en
-  el borde; en grupo, sugiere alejarse.
+## 8. Asistente de encuadre de personas ✅
+- Casilla "Encuadre personas". Con **Pose Detection** (una persona) y las caras de Camera2 (grupos):
+  - cabeza cortada (se estima la coronilla desde nariz y hombros);
+  - alguien del grupo cortado en el borde;
+  - hombros o caderas tocando el borde ("dejale aire");
+  - corte en las rodillas (rodillas abajo y tobillos fuera de cuadro);
+  - pies cortados.
 
 ## 9. Seguimiento de mascotas
 - **Object Detection** (con clasificación) o **Image Labeling** para detectar perros y gatos, y
   mantenerles AF/AE como a las caras.
 
-## 10. Sugerencias de escena por contenido
-- **Image Labeling** (≈400 etiquetas) complementa las reglas de brillo e histograma actuales:
-  comida → WB natural y 4:5; cielo nocturno → Astro; texto → nitidez alta; mascota → seguimiento.
+## 10. Sugerencias de escena por contenido ✅
+- **Image Labeling** (≈400 etiquetas, confianza ≥ 0.65, una vez por segundo) se suma a las reglas
+  de brillo e histograma. Nuevas sugerencias (se aplican con un toque):
+  - 3+ caras → timer de grupo + ráfaga ×4 con la mejor;
+  - mascota → modo niños;
+  - comida → guía 4:5 + JPEG natural;
+  - producto electrónico → guía 1:1 + centrar producto;
+  - nieve/playa → +0.7 EV.
+- Las reglas de poca luz siguen teniendo prioridad.
+- Dependencia: `com.google.mlkit:image-labeling`.
 
-## 11. Etiquetas y carpetas automáticas
-- Guardar etiquetas como palabras clave en los metadatos, o separar en `RawCam/Productos` y
-  `RawCam/Familia`, para buscarlas después en Lightroom o Google Fotos.
+## 11. Etiquetas y carpetas automáticas ✅
+- Casilla "Carpetas auto": cada captura va a `DCIM/RawCam/<Categoría>/`, con categoría Personas
+  (hay caras), Mascotas, Comida, Productos, Paisajes u Otros. El SKU tiene prioridad.
+- Las primeras 5 etiquetas se escriben en el JPEG (`ImageDescription` y `UserComment`). El DNG no
+  se toca.
+- Pendiente: palabras clave XMP en el DNG para Lightroom.
 
 ## Fuera de alcance en el Pixel 7
 - APIs de IA generativa en el dispositivo (Gemini Nano), por ejemplo para redactar el texto de
