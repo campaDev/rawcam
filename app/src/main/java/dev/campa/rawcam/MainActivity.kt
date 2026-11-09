@@ -22,7 +22,10 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.hardware.camera2.params.ColorSpaceTransform
 import android.hardware.camera2.params.MeteringRectangle
+import android.hardware.camera2.params.RggbChannelVector
+import android.os.Build
 import android.media.ExifInterface
 import android.media.Image
 import android.media.ImageReader
@@ -68,6 +71,17 @@ class MainActivity : Activity() {
     private data class Drive(val label: String, val kind: DriveKind, val evs: List<Double>)
     private data class Exposure(val iso: Int, val time: Long)
     private data class Frame(val name: String, val withJpeg: Boolean)
+    private data class Lens(val id: String, val zoom: Float, val label: String)
+
+    private enum class Wb(val label: String, val awb: Int) {
+        AUTO("WB auto", CaptureRequest.CONTROL_AWB_MODE_AUTO),
+        DAYLIGHT("WB luz día", CaptureRequest.CONTROL_AWB_MODE_DAYLIGHT),
+        CLOUDY("WB nublado", CaptureRequest.CONTROL_AWB_MODE_CLOUDY_DAYLIGHT),
+        SHADE("WB sombra", CaptureRequest.CONTROL_AWB_MODE_SHADE),
+        TUNGSTEN("WB incandesc.", CaptureRequest.CONTROL_AWB_MODE_INCANDESCENT),
+        FLUORESCENT("WB fluoresc.", CaptureRequest.CONTROL_AWB_MODE_FLUORESCENT),
+        KELVIN("WB Kelvin", CaptureRequest.CONTROL_AWB_MODE_OFF),
+    }
 
     private val drives = listOf(
         Drive("Simple", DriveKind.SINGLE, listOf(0.0)),
@@ -102,6 +116,25 @@ class MainActivity : Activity() {
     private lateinit var zebraToggle: CheckBox
     private lateinit var peakToggle: CheckBox
     private lateinit var gridToggle: CheckBox
+    private lateinit var focusToggle: CheckBox
+    private lateinit var focusLabel: TextView
+    private lateinit var focusBar: SeekBar
+    private lateinit var wbBtn: Button
+    private lateinit var lensBtn: Button
+    private lateinit var kelvinLabel: TextView
+    private lateinit var kelvinBar: SeekBar
+
+    private val lenses = ArrayList<Lens>()
+    private var lensIndex = 0
+    private var wbOptions = listOf(Wb.AUTO)
+    private var wbIndex = 0
+    private var minFocusDiopters = 0f
+    @Volatile private var zoomRatio = 1f
+    @Volatile private var manualFocus = false
+    @Volatile private var focusDiopters = 0f
+    @Volatile private var wbMode = Wb.AUTO
+    @Volatile private var kelvin = 5500
+    @Volatile private var lastTransform: ColorSpaceTransform? = null
 
     private val sensors by lazy { getSystemService(SensorManager::class.java) }
     private var levelDeg = 0f
@@ -195,6 +228,13 @@ class MainActivity : Activity() {
         zebraToggle = findViewById(R.id.zebraToggle)
         peakToggle = findViewById(R.id.peakToggle)
         gridToggle = findViewById(R.id.gridToggle)
+        focusToggle = findViewById(R.id.focusToggle)
+        focusLabel = findViewById(R.id.focusLabel)
+        focusBar = findViewById(R.id.focusBar)
+        wbBtn = findViewById(R.id.wbBtn)
+        lensBtn = findViewById(R.id.lensBtn)
+        kelvinLabel = findViewById(R.id.kelvinLabel)
+        kelvinBar = findViewById(R.id.kelvinBar)
 
         gridToggle.setOnCheckedChangeListener { _, checked -> overlay.showGrid = checked }
         val analysisToggle = { _: android.widget.CompoundButton, _: Boolean ->
@@ -208,14 +248,14 @@ class MainActivity : Activity() {
             height = resources.displayMetrics.widthPixels * 4 / 3
         }
 
-        if (!selectCamera()) {
+        buildLenses()
+        if (lenses.isEmpty()) {
             toast("No hay cámara trasera con soporte RAW")
             finish()
             return
         }
-
-        evBar.max = evRange.upper - evRange.lower
-        evBar.progress = -evRange.lower
+        loadCamera(lenses[0].id)
+        applyCameraRanges()
 
         val bars = object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) = syncControls()
@@ -225,6 +265,16 @@ class MainActivity : Activity() {
         evBar.setOnSeekBarChangeListener(bars)
         isoBar.setOnSeekBarChangeListener(bars)
         expBar.setOnSeekBarChangeListener(bars)
+        focusBar.setOnSeekBarChangeListener(bars)
+        kelvinBar.setOnSeekBarChangeListener(bars)
+
+        focusToggle.setOnCheckedChangeListener { _, _ -> syncControls() }
+        wbBtn.setOnClickListener {
+            wbIndex = (wbIndex + 1) % wbOptions.size
+            updateButtons()
+            syncControls()
+        }
+        lensBtn.setOnClickListener { switchLens((lensIndex + 1) % lenses.size) }
 
         modeGroup.setOnCheckedChangeListener { _, id ->
             mode = when (id) {
@@ -313,16 +363,83 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun selectCamera(): Boolean {
-        val id = manager.cameraIdList.firstOrNull { id ->
+    /**
+     * One entry per RAW-capable back camera, plus an ultra-wide entry when a logical camera
+     * reaches below 1× through CONTROL_ZOOM_RATIO (how the Pixel exposes its ultra-wide).
+     */
+    private fun buildLenses() {
+        lenses.clear()
+        for (id in manager.cameraIdList) {
             val c = manager.getCameraCharacteristics(id)
-            c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK &&
-                c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
-                    ?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW) == true
-        } ?: return false
+            val back = c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
+            val raw = c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+                ?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW) == true
+            if (!back || !raw) continue
 
+            val focal = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
+            val main = if (lenses.isEmpty()) "1×" else "Cam $id"
+            lenses += Lens(id, 1f, if (focal != null) String.format(Locale.US, "%s (%.1fmm)", main, focal) else main)
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val zoom = c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+                if (zoom != null && zoom.lower < 0.99f) {
+                    lenses += Lens(id, zoom.lower, String.format(Locale.US, "Gran angular %.1f×", zoom.lower))
+                }
+            }
+        }
+    }
+
+    private fun switchLens(index: Int) {
+        if (busy || index == lensIndex) return
+        val target = lenses[index]
+        val sameCamera = target.id == cameraId
+        lensIndex = index
+        zoomRatio = target.zoom
+        focusRegion = null
+        locked = false
+        focusRing.visibility = View.GONE
+        lockBadge.visibility = View.GONE
+        updateButtons()
+        if (sameCamera) {
+            syncControls()
+            return
+        }
+        handler.post {
+            closeCamera()
+            runOnUiThread {
+                loadCamera(target.id)
+                applyCameraRanges()
+                syncControls()
+                handler.post { openCamera() }
+            }
+        }
+    }
+
+    /** Re-applies per-camera slider ranges and option lists after loading a camera. */
+    private fun applyCameraRanges() {
+        evBar.max = evRange.upper - evRange.lower
+        evBar.progress = -evRange.lower
+        focusToggle.isEnabled = minFocusDiopters > 0f
+        if (minFocusDiopters <= 0f) focusToggle.isChecked = false
+        wbIndex = wbIndex.coerceIn(0, wbOptions.size - 1)
+        updateButtons()
+    }
+
+    private fun loadCamera(id: String) {
         cameraId = id
         chars = manager.getCameraCharacteristics(id)
+        minFocusDiopters = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+        val awbModes = chars.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)?.toSet() ?: emptySet()
+        val manualPost = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+            ?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_POST_PROCESSING) == true
+        wbOptions = Wb.values().filter { wb ->
+            when (wb) {
+                Wb.AUTO -> true
+                Wb.KELVIN -> manualPost && wb.awb in awbModes
+                else -> wb.awb in awbModes
+            }
+        }
+        lastTransform = null
         isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)!!
         expRange = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)!!
         evRange = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE) ?: Range(0, 0)
@@ -332,7 +449,6 @@ class MainActivity : Activity() {
         maxAeRegions = chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
         maxExposure = min(expRange.upper, 1_000_000_000L)
         sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
-        return true
     }
 
     // ---- UI ----
@@ -350,6 +466,24 @@ class MainActivity : Activity() {
         expLabel.text = "Obturación ${formatExposure(expValue)}"
         evLabel.text = String.format(Locale.US, "Compensación %+.1f EV", evIndex * evStep.toDouble())
 
+        manualFocus = focusToggle.isChecked && minFocusDiopters > 0f
+        focusBar.isEnabled = manualFocus
+        val t = focusBar.progress / 1000f
+        focusDiopters = minFocusDiopters * t * t
+        focusLabel.text = when {
+            minFocusDiopters <= 0f -> "Esta lente tiene foco fijo"
+            !manualFocus -> "Foco: automático"
+            focusDiopters < 0.01f -> "Foco: ∞"
+            else -> String.format(Locale.US, "Foco: %.2f m", 1f / focusDiopters)
+        }
+
+        wbMode = wbOptions.getOrElse(wbIndex) { Wb.AUTO }
+        kelvin = 2000 + kelvinBar.progress * 100
+        val showKelvin = if (wbMode == Wb.KELVIN) View.VISIBLE else View.GONE
+        kelvinLabel.visibility = showKelvin
+        kelvinBar.visibility = showKelvin
+        kelvinLabel.text = "Temperatura ${kelvin}K"
+
         handler.removeCallbacks(previewUpdate)
         handler.postDelayed(previewUpdate, 50)
     }
@@ -360,6 +494,9 @@ class MainActivity : Activity() {
         driveBtn.text = drives[driveIndex].label
         val secs = timers[timerIndex]
         timerBtn.text = if (secs == 0) "Timer: no" else "Timer: ${secs}s"
+        wbBtn.text = wbOptions.getOrElse(wbIndex) { Wb.AUTO }.label
+        lensBtn.text = "Lente: ${lenses.getOrNull(lensIndex)?.label ?: "-"}"
+        lensBtn.isEnabled = lenses.size > 1
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -660,9 +797,53 @@ class MainActivity : Activity() {
         previewSurface = null
     }
 
+    /** Focus, white balance and zoom shared by preview and still requests. */
+    private fun CaptureRequest.Builder.applyCommon() {
+        applyFocus()
+        applyWhiteBalance()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && zoomRatio != 1f) {
+            set(CaptureRequest.CONTROL_ZOOM_RATIO, zoomRatio)
+        }
+    }
+
+    private fun CaptureRequest.Builder.applyWhiteBalance() {
+        val transform = lastTransform
+        if (wbMode == Wb.KELVIN && transform != null) {
+            set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
+            set(CaptureRequest.COLOR_CORRECTION_MODE, CaptureRequest.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
+            set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, transform)
+            set(CaptureRequest.COLOR_CORRECTION_GAINS, kelvinGains(kelvin))
+        } else {
+            // Kelvin falls back to auto until a color transform has been observed.
+            val awb = if (wbMode == Wb.KELVIN) CaptureRequest.CONTROL_AWB_MODE_AUTO else wbMode.awb
+            set(CaptureRequest.CONTROL_AWB_MODE, awb)
+        }
+    }
+
+    /** White-balance gains that neutralise a light source of the given colour temperature (Tanner Helland fit). */
+    private fun kelvinGains(k: Int): RggbChannelVector {
+        val t = k / 100.0
+        val r = if (t <= 66) 255.0 else 329.698727446 * (t - 60).pow(-0.1332047592)
+        val g = if (t <= 66) 99.4708025861 * ln(t) - 161.1195681661 else 288.1221695283 * (t - 60).pow(-0.0755148492)
+        val b = when {
+            t >= 66 -> 255.0
+            t <= 19 -> 0.0
+            else -> 138.5177312231 * ln(t - 10) - 305.0447927307
+        }
+        val rc = r.coerceIn(1.0, 255.0)
+        val gc = g.coerceIn(1.0, 255.0)
+        val bc = b.coerceIn(1.0, 255.0)
+        val rGain = (gc / rc).toFloat().coerceIn(0.1f, 8f)
+        val bGain = (gc / bc).toFloat().coerceIn(0.1f, 8f)
+        return RggbChannelVector(rGain, 1f, 1f, bGain)
+    }
+
     private fun CaptureRequest.Builder.applyFocus() {
         val region = focusRegion
-        if (region != null && maxAfRegions > 0) {
+        if (manualFocus) {
+            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+            set(CaptureRequest.LENS_FOCUS_DISTANCE, focusDiopters)
+        } else if (region != null && maxAfRegions > 0) {
             set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
             set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
         } else {
@@ -679,7 +860,7 @@ class MainActivity : Activity() {
         device!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
             addTarget(previewSurface!!)
             set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-            applyFocus()
+            applyCommon()
             if (mode == Mode.MANUAL) {
                 var time = expValue
                 var iso = isoValue
@@ -719,6 +900,12 @@ class MainActivity : Activity() {
                 meteredIso = iso
                 meteredExp = time
             }
+            if (result.get(CaptureResult.CONTROL_AWB_MODE) != CaptureResult.CONTROL_AWB_MODE_OFF) {
+                val transform = result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
+                val firstTransform = lastTransform == null && transform != null
+                if (transform != null) lastTransform = transform
+                if (firstTransform && wbMode == Wb.KELVIN) handler.post { refreshPreview() }
+            }
             if (frameCount++ % 10 != 0) return
             val shot = baseExposure()
             val text = "${modeLabel()} · Visor: ISO $iso · ${formatExposure(time)}\n" +
@@ -732,7 +919,7 @@ class MainActivity : Activity() {
             addTarget(rawReader!!.surface)
             if (frame.withJpeg) addTarget(jpegReader!!.surface)
             set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-            applyFocus()
+            applyCommon()
             set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
             set(CaptureRequest.SENSOR_SENSITIVITY, e.iso)
             set(CaptureRequest.SENSOR_EXPOSURE_TIME, e.time)
