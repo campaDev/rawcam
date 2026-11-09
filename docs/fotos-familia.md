@@ -1,7 +1,13 @@
-# Fotos de familia (diseño, pendiente)
+# Fotos de familia
 
-Estado: **diseño, sin implementar**. Funciones para capturar el momento: nadie con los ojos
-cerrados, niños que no salgan movidos y el fotógrafo también dentro de la foto.
+Funciones para capturar el momento: nadie con los ojos cerrados, niños que no salgan movidos y
+el fotógrafo también dentro de la foto.
+
+Estado:
+- ✅ Implementado: **1** timer de grupo, **2** modo niños, **4** mejor toma de grupo,
+  **6** disparo con gesto (mano por encima de la cabeza, con ML Kit Pose Detection).
+- ⏳ Pendiente: **3** disparo con sonrisa, **5** retrato con fondo desenfocado.
+- Dependencias ya agregadas: `com.google.mlkit:face-detection`, `com.google.mlkit:pose-detection`.
 
 ## Prioridades
 

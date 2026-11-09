@@ -34,3 +34,9 @@ android {
         jvmTarget = "17"
     }
 }
+
+dependencies {
+    // On-device ML Kit (bundled models, no network): eyes/smile per face, and body pose for the hand gesture.
+    implementation("com.google.mlkit:face-detection:16.1.7")
+    implementation("com.google.mlkit:pose-detection:18.0.0-beta5")
+}

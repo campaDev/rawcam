@@ -6,6 +6,7 @@ import android.app.Activity
 import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.SurfaceTexture
@@ -56,6 +57,15 @@ import android.widget.RadioGroup
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import com.google.android.gms.tasks.Tasks
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.face.FaceDetection
+import com.google.mlkit.vision.face.FaceDetectorOptions
+import com.google.mlkit.vision.pose.Pose
+import com.google.mlkit.vision.pose.PoseDetection
+import com.google.mlkit.vision.pose.PoseLandmark
+import com.google.mlkit.vision.pose.defaults.PoseDetectorOptions
+import java.io.ByteArrayInputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.text.SimpleDateFormat
@@ -84,9 +94,13 @@ class MainActivity : Activity() {
         val stack: Boolean = false,
         val infinity: Boolean = false,
         val scored: Boolean = false,
+        val saveJpeg: Boolean = withJpeg,
     )
 
-    private class ScoredShot(val base: String, val uri: Uri, val score: Float)
+    private class ScoredShot(val base: String, val uris: MutableList<Uri>, val score: Float, val faces: Int, val eyesOpen: Int)
+
+    /** Eyes/smile verdict for one burst frame (faces < 0 when not evaluated). */
+    private class GroupScore(val factor: Float, val faces: Int, val eyesOpen: Int)
 
     private enum class SaveFormat(val label: String) {
         BOTH("RAW + JPEG"),
@@ -128,7 +142,7 @@ class MainActivity : Activity() {
         Guide("Guía 4:5 · IG/FB vertical", 0.8f, false),
         Guide("Guía 9:16 · TikTok/Reels/Estados", 9f / 16f, true),
     )
-    private val timers = listOf(0, 2, 10)
+    private val timers = listOf(0, 2, 10, GROUP_TIMER)
     private val intervals = listOf(0, 2, 5, 10, 30, 60)
     private val shotCounts = listOf(10, 30, 100, 300)
 
@@ -198,6 +212,18 @@ class MainActivity : Activity() {
     // Camera handler thread only.
     private var burstSequence = false
     @Volatile private var bestOnly = false
+
+    private lateinit var kidsToggle: CheckBox
+    private lateinit var gestureToggle: CheckBox
+    @Volatile private var faceCount = 0
+    private val groupFaceDetector by lazy {
+        FaceDetection.getClient(
+            FaceDetectorOptions.Builder()
+                .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
+                .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
+                .build()
+        )
+    }
 
     private lateinit var guideBtn: Button
     private lateinit var sessionToggle: CheckBox
@@ -383,6 +409,13 @@ class MainActivity : Activity() {
         locationToggle = findViewById(R.id.locationToggle)
         intervalBtn = findViewById(R.id.intervalBtn)
         shotsBtn = findViewById(R.id.shotsBtn)
+        kidsToggle = findViewById(R.id.kidsToggle)
+        gestureToggle = findViewById(R.id.gestureToggle)
+        kidsToggle.setOnCheckedChangeListener { _, checked -> if (checked) startKidsMode() else endKidsMode() }
+        gestureToggle.setOnCheckedChangeListener { _, checked ->
+            if (checked) toast("Levantá una mano por encima de la cabeza para disparar (timer 2 s)")
+        }
+
         guideBtn = findViewById(R.id.guideBtn)
         sessionToggle = findViewById(R.id.sessionToggle)
         guideBtn.setOnClickListener {
@@ -404,6 +437,7 @@ class MainActivity : Activity() {
         faceToggle.setOnCheckedChangeListener { _, checked ->
             useFaces = checked
             if (!checked) {
+                faceCount = 0
                 overlay.setFaces(emptyList())
                 handler.post {
                     faceRegion = null
@@ -626,6 +660,7 @@ class MainActivity : Activity() {
     override fun onPause() {
         stopInterval()
         cancelSteady()
+        cancelGroupTimer()
         stopLocation()
         sensors.unregisterListener(levelListener)
         sensors.unregisterListener(gyroListener)
@@ -812,7 +847,11 @@ class MainActivity : Activity() {
     private fun updateButtons() {
         driveBtn.text = drives[driveIndex].label
         val secs = timers[timerIndex]
-        timerBtn.text = if (secs == 0) "Timer: no" else "Timer: ${secs}s"
+        timerBtn.text = when (secs) {
+            0 -> "Timer: no"
+            GROUP_TIMER -> "Timer: grupo"
+            else -> "Timer: ${secs}s"
+        }
         wbBtn.text = wbOptions.getOrElse(wbIndex) { Wb.AUTO }.label
         lensBtn.text = "Lente: ${lenses.getOrNull(lensIndex)?.label ?: "-"}"
         lensBtn.isEnabled = lenses.size > 1
@@ -1011,6 +1050,10 @@ class MainActivity : Activity() {
             cancelSteady()
             return
         }
+        if (waitingGroup) {
+            cancelGroupTimer()
+            return
+        }
         if (counting) {
             cancelCountdown()
             return
@@ -1020,15 +1063,143 @@ class MainActivity : Activity() {
             startInterval()
             return
         }
-        val secs = timers[timerIndex]
-        if (secs == 0) {
-            fire()
-            return
+        when (val secs = timers[timerIndex]) {
+            0 -> fire()
+            GROUP_TIMER -> startGroupTimer()
+            else -> startCountdown(secs)
         }
+    }
+
+    private fun startCountdown(secs: Int) {
         counting = true
         countdownLeft = secs
         countdownText.visibility = View.VISIBLE
         ui.post(tick)
+    }
+
+    // ---- Group timer: waits for one more face (the photographer) before counting down ----
+
+    private var waitingGroup = false
+    private var groupTarget = 0
+    private var groupSince = 0L
+    private var groupDeadline = 0L
+
+    private fun startGroupTimer() {
+        if (faceMode == CameraCharacteristics.STATISTICS_FACE_DETECT_MODE_OFF) {
+            toast("Esta cámara no detecta caras: uso el timer de 10 s")
+            startCountdown(10)
+            return
+        }
+        if (!faceToggle.isChecked) faceToggle.isChecked = true
+        waitingGroup = true
+        groupTarget = faceCount + 1
+        groupSince = 0L
+        groupDeadline = android.os.SystemClock.uptimeMillis() + GROUP_MAX_WAIT_MS
+        ui.post(groupTick)
+    }
+
+    private val groupTick = object : Runnable {
+        override fun run() {
+            if (!waitingGroup) return
+            val now = android.os.SystemClock.uptimeMillis()
+            val count = faceCount
+            shutter.text = "Esperando que entres en la foto (caras $count/$groupTarget) · tocá para cancelar"
+            if (count >= groupTarget) {
+                if (groupSince == 0L) groupSince = now
+                if (now - groupSince >= GROUP_HOLD_MS) {
+                    waitingGroup = false
+                    startCountdown(2)
+                    return
+                }
+            } else {
+                groupSince = 0L
+            }
+            if (now >= groupDeadline) {
+                cancelGroupTimer()
+                toast("No apareció nadie nuevo en 30 s: timer cancelado")
+                return
+            }
+            ui.postDelayed(this, 200)
+        }
+    }
+
+    private fun cancelGroupTimer() {
+        waitingGroup = false
+        ui.removeCallbacks(groupTick)
+        updateShutterIdle()
+    }
+
+    // ---- Kids mode ----
+
+    /** Fast shutter (shutter priority at 1/250 s, auto ISO), face tracking and burst ×4 keeping the sharpest. */
+    private fun startKidsMode() {
+        if (sessionToggle.isChecked) sessionToggle.isChecked = false
+        steadyToggle.isChecked = false
+        faceToggle.isChecked = true
+        bestToggle.isChecked = true
+        modeGroup.check(R.id.modeShutter)
+        val target = KIDS_EXPOSURE_NS.coerceIn(expRange.lower, maxExposure)
+        expBar.progress = inverseLogLerp(expRange.lower.toDouble(), maxExposure.toDouble(), target.toDouble())
+        driveIndex = driveNamed("Ráfaga ×4").coerceAtLeast(0)
+        updateButtons()
+        updateAstro(-1)
+        toast("Modo niños: 1/250 s, caras y ráfaga ×4 con la mejor")
+    }
+
+    private fun endKidsMode() {
+        steadyToggle.isChecked = true
+        bestToggle.isChecked = false
+        modeGroup.check(R.id.modeAuto)
+        driveIndex = 0
+        updateButtons()
+    }
+
+    // ---- Hand gesture: wrist above the nose, held briefly, starts a 2 s countdown ----
+
+    private val poseDetector by lazy {
+        PoseDetection.getClient(
+            PoseDetectorOptions.Builder().setDetectorMode(PoseDetectorOptions.STREAM_MODE).build()
+        )
+    }
+    private var poseBusy = false
+    private var lastPoseAt = 0L
+    private var handUpSince = 0L
+    private var gestureCooldownUntil = 0L
+
+    private fun maybeDetectPose() {
+        if (!gestureToggle.isChecked || poseBusy) return
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - lastPoseAt < POSE_INTERVAL_MS) return
+        lastPoseAt = now
+        poseBusy = true
+        val copy = grabBitmap.copy(Bitmap.Config.ARGB_8888, false)
+        poseDetector.process(InputImage.fromBitmap(copy, 0))
+            .addOnSuccessListener { onPose(it) }
+            .addOnCompleteListener {
+                poseBusy = false
+                copy.recycle()
+            }
+    }
+
+    private fun onPose(pose: Pose) {
+        val now = android.os.SystemClock.uptimeMillis()
+        val nose = pose.getPoseLandmark(PoseLandmark.NOSE)
+        val wrists = listOf(pose.getPoseLandmark(PoseLandmark.LEFT_WRIST), pose.getPoseLandmark(PoseLandmark.RIGHT_WRIST))
+        val raised = nose != null && nose.inFrameLikelihood > 0.5f && wrists.any {
+            it != null && it.inFrameLikelihood > 0.6f && it.position.y < nose.position.y
+        }
+        if (!raised || busy || counting || waitingGroup || waitingSteady || intervalRunning || now < gestureCooldownUntil) {
+            handUpSince = 0L
+            return
+        }
+        if (handUpSince == 0L) handUpSince = now
+        if (now - handUpSince >= GESTURE_HOLD_MS) {
+            handUpSince = 0L
+            gestureCooldownUntil = now + GESTURE_COOLDOWN_MS
+            preview.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            toast("✋ Gesto detectado")
+            startCountdown(2)
+        }
     }
 
     private val tick = object : Runnable {
@@ -1196,13 +1367,14 @@ class MainActivity : Activity() {
 
     private fun needsAnalysis() =
         histToggle.isChecked || zebraToggle.isChecked || peakToggle.isChecked || lensToggle.isChecked ||
-            ettrToggle.isChecked || sceneToggle.isChecked || astroSelected()
+            ettrToggle.isChecked || sceneToggle.isChecked || astroSelected() || gestureToggle.isChecked
 
     private val grabTick = object : Runnable {
         override fun run() {
             if (needsAnalysis() && preview.isAvailable && !analyzing) {
                 preview.getBitmap(grabBitmap)
                 grabBitmap.getPixels(pixels, 0, ANALYSIS_W, 0, 0, ANALYSIS_W, ANALYSIS_H)
+                maybeDetectPose()
                 analyzing = true
                 val hist = histToggle.isChecked
                 val zebra = zebraToggle.isChecked
@@ -1737,6 +1909,7 @@ class MainActivity : Activity() {
 
     private fun handleFaces(faces: Array<android.hardware.camera2.params.Face>?) {
         val valid = faces?.filter { it.score >= FACE_MIN_SCORE } ?: emptyList()
+        faceCount = valid.size
         val best = valid.maxByOrNull { it.bounds.width() * it.bounds.height() }
         val next = best?.let { MeteringRectangle(clampToActive(it.bounds), MeteringRectangle.METERING_WEIGHT_MAX - 1) }
         val now = android.os.SystemClock.uptimeMillis()
@@ -1914,6 +2087,7 @@ class MainActivity : Activity() {
         val jpegOnly = saveFormat == SaveFormat.JPEG && !isStack
         val withJpeg = jpegOnly || (drive.kind == DriveKind.SINGLE && saveFormat == SaveFormat.BOTH)
         val location = if (useLocation) lastLocation else null
+        val groupFaces = useFaces && faceCount > 0
 
         val requests = try {
             drive.evs.mapIndexed { i, ev ->
@@ -1925,7 +2099,9 @@ class MainActivity : Activity() {
                 }
                 val e = if (ev == 0.0) baseExp else shifted(baseExp, ev)
                 val scored = drive.kind == DriveKind.BURST && !jpegOnly
-                stillRequest(e, Frame(base, !jpegOnly, withJpeg, location, isStack, drive.infinity, scored))
+                // With people in frame, bursts also capture a JPEG so blinks can be scored.
+                val jpegTarget = withJpeg || (scored && groupFaces)
+                stillRequest(e, Frame(base, !jpegOnly, jpegTarget, location, isStack, drive.infinity, scored, withJpeg))
             }
         } catch (e: Exception) {
             toast("Captura: ${e.message}")
@@ -2014,8 +2190,14 @@ class MainActivity : Activity() {
         pendingJpegs.remove(ts)
         io.execute {
             var ok = true
-            if (raw != null) ok = if (frame.stack) accumulate(raw, result, frame) else saveDng(raw, result, frame)
-            if (jpeg != null) ok = saveJpeg(jpeg, "IMG_${frame.base}.jpg") && ok
+            val jpegBytes = jpeg?.let { readJpeg(it) }
+            val group = if (frame.scored && jpegBytes != null) groupScore(jpegBytes) else null
+            if (raw != null) ok = if (frame.stack) accumulate(raw, result, frame) else saveDng(raw, result, frame, group)
+            if (jpegBytes != null && frame.saveJpeg) {
+                val uri = saveJpegBytes(jpegBytes, "IMG_${frame.base}.jpg")
+                if (uri == null) ok = false
+                else if (frame.scored) scoredShots.lastOrNull { it.base == frame.base }?.uris?.add(uri)
+            }
             handler.post {
                 if (!busy) return@post
                 inFlight--
@@ -2099,22 +2281,61 @@ class MainActivity : Activity() {
         val worst = scoredShots.minBy { it.score }
         val worstPct = (worst.score / best.score * 100).roundToInt()
         val label = best.base.substringAfterLast('_')
+        val eyes = if (best.faces > 0) " · ojos abiertos ${best.eyesOpen}/${best.faces}" else ""
         if (keepOnlyBest) {
             var removed = 0
             for (shot in scoredShots) {
-                if (shot !== best) {
+                if (shot === best) continue
+                for (uri in shot.uris) {
                     try {
-                        removed += contentResolver.delete(shot.uri, null, null)
+                        removed += contentResolver.delete(uri, null, null)
                     } catch (e: Exception) {
                         // Leave the file if MediaStore refuses; the best one is still reported.
                     }
                 }
             }
-            toast("Guardada solo la más nítida ($label). Descartadas: $removed")
+            toast("Guardada solo la mejor ($label$eyes). Archivos descartados: $removed")
         } else {
-            toast("Más nítida: $label · la peor tiene $worstPct% de su nitidez")
+            toast("Mejor toma: $label$eyes · la peor tiene $worstPct% de su puntaje")
         }
         scoredShots.clear()
+    }
+
+    /**
+     * Eyes-open and smile factor for a burst frame, from ML Kit face classification on a
+     * downsampled copy of its JPEG. Frames where someone blinks score lower; with no faces the
+     * factor is neutral (1) so sharpness alone decides.
+     */
+    private fun groupScore(jpeg: ByteArray): GroupScore {
+        return try {
+            val opts = BitmapFactory.Options().apply { inSampleSize = 4 }
+            val bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, opts) ?: return GroupScore(1f, -1, 0)
+            val rotation = when (ExifInterface(ByteArrayInputStream(jpeg)).getAttributeInt(
+                ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL,
+            )) {
+                ExifInterface.ORIENTATION_ROTATE_90 -> 90
+                ExifInterface.ORIENTATION_ROTATE_180 -> 180
+                ExifInterface.ORIENTATION_ROTATE_270 -> 270
+                else -> 0
+            }
+            val faces = Tasks.await(groupFaceDetector.process(InputImage.fromBitmap(bmp, rotation)))
+            bmp.recycle()
+            if (faces.isEmpty()) return GroupScore(1f, 0, 0)
+            var eyesSum = 0f
+            var smileSum = 0f
+            var open = 0
+            for (f in faces) {
+                val eyes = min(f.leftEyeOpenProbability ?: 0.5f, f.rightEyeOpenProbability ?: 0.5f)
+                eyesSum += eyes
+                smileSum += f.smilingProbability ?: 0.5f
+                if (eyes > EYES_OPEN_MIN) open++
+            }
+            val n = faces.size
+            val factor = (eyesSum / n) * (0.8f + 0.2f * smileSum / n)
+            GroupScore(factor, n, open)
+        } catch (e: Exception) {
+            GroupScore(1f, -1, 0)
+        }
     }
 
     private fun showProgress() {
@@ -2210,9 +2431,11 @@ class MainActivity : Activity() {
 
     // ---- Saving (io thread) ----
 
-    private fun saveDng(image: Image, result: TotalCaptureResult, frame: Frame): Boolean {
+    private fun saveDng(image: Image, result: TotalCaptureResult, frame: Frame, group: GroupScore? = null): Boolean {
         return try {
-            val score = if (frame.scored) rawSharpness(image) else 0f
+            // Sharpness always counts; blinks and frowns pull a frame down when faces were evaluated.
+            val sharp = if (frame.scored) rawSharpness(image) else 0f
+            val score = if (group != null) sharp * (0.3f + 0.7f * group.factor) else sharp
             val uri = insertImage("RAW_${frame.base}.dng", "image/x-adobe-dng")
             contentResolver.openOutputStream(uri)!!.use { out ->
                 val (dngChars, dngResult) = dngSource(result)
@@ -2223,7 +2446,11 @@ class MainActivity : Activity() {
                 }
             }
             publish(uri)
-            if (frame.scored) scoredShots.add(ScoredShot(frame.base, uri, score))
+            if (frame.scored) {
+                scoredShots.add(
+                    ScoredShot(frame.base, mutableListOf(uri), score, group?.faces ?: -1, group?.eyesOpen ?: 0)
+                )
+            }
             true
         } catch (e: Exception) {
             toast("DNG: ${e.message}")
@@ -2251,19 +2478,28 @@ class MainActivity : Activity() {
         return manager.getCameraCharacteristics(physId) to physResult
     }
 
-    private fun saveJpeg(image: Image, name: String): Boolean {
+    /** Copies the encoded JPEG out of the camera buffer and releases the Image. */
+    private fun readJpeg(image: Image): ByteArray? {
         return try {
             val buffer = image.planes[0].buffer
-            val bytes = ByteArray(buffer.remaining()).also { buffer.get(it) }
+            ByteArray(buffer.remaining()).also { buffer.get(it) }
+        } catch (e: Exception) {
+            toast("JPEG: ${e.message}")
+            null
+        } finally {
+            image.close()
+        }
+    }
+
+    private fun saveJpegBytes(bytes: ByteArray, name: String): Uri? {
+        return try {
             val uri = insertImage(name, "image/jpeg")
             contentResolver.openOutputStream(uri)!!.use { it.write(bytes) }
             publish(uri)
-            true
+            uri
         } catch (e: Exception) {
             toast("JPEG: ${e.message}")
-            false
-        } finally {
-            image.close()
+            null
         }
     }
 
@@ -2307,6 +2543,15 @@ class MainActivity : Activity() {
         private const val HAZE_LIMIT = 0.16f
         private const val CONTRAST_LIMIT = 0.22f
         private const val GLOW_LIMIT = 0.50f
+
+        private const val GROUP_TIMER = -1
+        private const val GROUP_HOLD_MS = 1000L
+        private const val GROUP_MAX_WAIT_MS = 30_000L
+        private const val KIDS_EXPOSURE_NS = 4_000_000L
+        private const val POSE_INTERVAL_MS = 250L
+        private const val GESTURE_HOLD_MS = 500L
+        private const val GESTURE_COOLDOWN_MS = 4000L
+        private const val EYES_OPEN_MIN = 0.5f
 
         private const val CARD_SAMPLE_W = 240
         private const val CARD_SAMPLE_H = 320
